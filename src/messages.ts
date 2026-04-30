@@ -57,6 +57,8 @@ export function proposalMessage(proposal: Proposal, heading = "New Coin Idea"): 
     `&#128640; Launchpad: <b>${launchpadName(proposal.launchpad)}</b>`,
     `&#128205; Status: <b>${statusLabel(proposal.status)}</b>`,
     `&#128176; Dev Buy: <b>${proposal.devBuySol ?? "default"} SOL</b>`,
+    proposal.launchpad === "pumpfun" ? `Cashback: <b>${proposal.pumpfunCashback ? "Enabled" : "Off"}</b>` : undefined,
+    proposal.launchpad === "pumpfun" ? `Fee sharing: <b>${feeShareLabel(proposal.pumpfunFeeShares)}</b>` : undefined,
     "",
     
     `&#128221; ${escapeHtml(proposal.description)}`,
@@ -99,6 +101,13 @@ export function proposalKeyboard(proposal: Proposal): InlineKeyboardButton[][] {
     }
   }
 
+  if (proposal.launchpad === "pumpfun" && proposal.status !== "launched" && proposal.status !== "rejected") {
+    rows.push([
+      { text: proposal.pumpfunCashback ? "Cashback Off" : "Cashback On", callback_data: `cashback_toggle:${proposal.id}` },
+      { text: "Fees", callback_data: `fees_menu:${proposal.id}` }
+    ]);
+  }
+
   if (proposal.status === "pending" || proposal.status === "approved") {
     rows.push([{ text: "Reject with reason", switch_inline_query_current_chat: `/reject ${proposal.id} ` }]);
   }
@@ -121,6 +130,9 @@ export function commandHelpMessage(): string {
     "<code>/reject &lt;id&gt; reason</code> - reject an idea",
     "<code>/launchgroup &lt;id&gt;</code> - launch with the group wallet",
     "<code>/launchme &lt;id&gt;</code> - launch your own Pump.fun proposal with your personal wallet",
+    "<code>/cashback &lt;id&gt; on|off</code> - set Pump.fun cashback before launch",
+    "<code>/setfees &lt;id&gt; none|creator|wallet:bps,...</code> - set Pump.fun fee sharing before launch",
+    "<code>/feesettings &lt;id&gt;</code> - show Pump.fun fee settings",
     "<code>/launchcheck</code> - check production readiness",
     "<code>/groupwallet</code> - create/show group wallet",
     "<code>/groupbalance</code> - check group wallet balance",
@@ -243,6 +255,12 @@ function launchpadName(launchpad: Proposal["launchpad"]): string {
   if (launchpad === "bonk") return "Bonk";
   if (launchpad === "bags") return "BagsApp";
   return "Pump.fun";
+}
+
+function feeShareLabel(value: string | undefined): string {
+  if (!value) return "None";
+  if (value === "creator:10000") return "Creator 100%";
+  return escapeHtml(value);
 }
 
 function statusLabel(status: Proposal["status"]): string {

@@ -22,6 +22,8 @@ db.exec(`
     twitter TEXT,
     image TEXT,
     dev_buy_sol REAL,
+    pumpfun_cashback INTEGER,
+    pumpfun_fee_shares TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     created_by INTEGER NOT NULL,
     created_by_username TEXT,
@@ -72,6 +74,18 @@ try {
 
 try {
   db.prepare("ALTER TABLE wallets ADD COLUMN provider TEXT NOT NULL DEFAULT 'local'").run();
+} catch {
+  // Column already exists.
+}
+
+try {
+  db.prepare("ALTER TABLE proposals ADD COLUMN pumpfun_cashback INTEGER").run();
+} catch {
+  // Column already exists.
+}
+
+try {
+  db.prepare("ALTER TABLE proposals ADD COLUMN pumpfun_fee_shares TEXT").run();
 } catch {
   // Column already exists.
 }
@@ -153,6 +167,8 @@ function mapProposal(row: Record<string, unknown>): Proposal {
     twitter: row.twitter ? String(row.twitter) : undefined,
     image: row.image ? String(row.image) : undefined,
     devBuySol: row.dev_buy_sol ? Number(row.dev_buy_sol) : undefined,
+    pumpfunCashback: row.pumpfun_cashback === null || row.pumpfun_cashback === undefined ? undefined : Boolean(row.pumpfun_cashback),
+    pumpfunFeeShares: row.pumpfun_fee_shares ? String(row.pumpfun_fee_shares) : undefined,
     status: row.status as Proposal["status"],
     createdBy: Number(row.created_by),
     createdByUsername: row.created_by_username ? String(row.created_by_username) : undefined,
@@ -174,8 +190,8 @@ export function createProposal(
     .prepare(
       `INSERT INTO proposals (
         launchpad, name, symbol, description, website, telegram, twitter, image,
-        dev_buy_sol, created_by, created_by_username, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        dev_buy_sol, pumpfun_cashback, pumpfun_fee_shares, created_by, created_by_username, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       idea.launchpad,
@@ -187,6 +203,8 @@ export function createProposal(
       idea.twitter ?? null,
       idea.image ?? null,
       idea.devBuySol ?? null,
+      idea.pumpfunCashback === undefined ? null : Number(idea.pumpfunCashback),
+      idea.pumpfunFeeShares ?? null,
       createdBy,
       createdByUsername ?? null,
       createdAt
@@ -195,6 +213,22 @@ export function createProposal(
   const proposal = getProposal(Number(result.lastInsertRowid));
   if (!proposal) throw new Error("Failed to read proposal after insert.");
   return proposal;
+}
+
+export function updateProposalCashback(id: number, enabled: boolean): Proposal | undefined {
+  db.prepare("UPDATE proposals SET pumpfun_cashback = ? WHERE id = ? AND status IN ('pending', 'approved')").run(
+    Number(enabled),
+    id
+  );
+  return getProposal(id);
+}
+
+export function updateProposalFeeShares(id: number, feeShares?: string): Proposal | undefined {
+  db.prepare("UPDATE proposals SET pumpfun_fee_shares = ? WHERE id = ? AND status IN ('pending', 'approved')").run(
+    feeShares?.trim() || null,
+    id
+  );
+  return getProposal(id);
 }
 
 export function getProposal(id: number): Proposal | undefined {

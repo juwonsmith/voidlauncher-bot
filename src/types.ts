@@ -11,6 +11,8 @@ export interface CoinIdeaInput {
   twitter?: string;
   image?: string;
   devBuySol?: number;
+  pumpfunCashback?: boolean;
+  pumpfunFeeShares?: string;
 }
 
 export interface Proposal extends CoinIdeaInput {

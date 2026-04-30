@@ -11,7 +11,9 @@ import {
   markLaunched,
   quarantineInexactVanityMints,
   rejectProposal,
-  listWallets
+  listWallets,
+  updateProposalCashback,
+  updateProposalFeeShares
 } from "./db.js";
 import { launchProposal } from "./launchpads/index.js";
 import {
@@ -67,6 +69,8 @@ type DraftStep =
   | "twitter"
   | "image"
   | "devBuy"
+  | "cashback"
+  | "feeShares"
   | "preview";
 
 interface Draft {
@@ -536,6 +540,43 @@ bot.command("launchme", async (ctx) => {
   runLaunchInBackground(ctx, () => runPersonalLaunch(ctx, id));
 });
 
+bot.command("feesettings", async (ctx) => {
+  const id = parseIdArg(ctx.message.text);
+  if (!id) return ctx.reply("Usage: /feesettings <proposal_id>");
+  const proposal = getProposal(id);
+  if (!proposal) return ctx.reply(`Proposal #${id} not found.`);
+  return ctx.reply(feeSettingsMessage(proposal), telegramReplyOptions);
+});
+
+bot.command("cashback", async (ctx) => {
+  const [, idText, value] = ctx.message.text.split(/\s+/, 3);
+  const id = Number(idText);
+  if (!Number.isInteger(id) || id <= 0 || !value) return ctx.reply("Usage: /cashback <proposal_id> on|off");
+  const proposal = getProposal(id);
+  if (!proposal) return ctx.reply(`Proposal #${id} not found.`);
+  if (!(await canEditProposalSettings(ctx, proposal))) return ctx.reply("Only the proposal creator or an admin can edit this.");
+  if (proposal.launchpad !== "pumpfun") return ctx.reply("Cashback only applies to Pump.fun proposals.");
+  const enabled = parseOnOff(value);
+  const updated = updateProposalCashback(id, enabled);
+  return ctx.reply(feeSettingsMessage(updated ?? proposal), telegramReplyOptions);
+});
+
+bot.command("setfees", async (ctx) => {
+  const [, idText, ...valueParts] = ctx.message.text.split(/\s+/);
+  const id = Number(idText);
+  const value = valueParts.join("").trim();
+  if (!Number.isInteger(id) || id <= 0 || !value) {
+    return ctx.reply("Usage: /setfees <proposal_id> none|creator|wallet:bps,wallet:bps");
+  }
+  const proposal = getProposal(id);
+  if (!proposal) return ctx.reply(`Proposal #${id} not found.`);
+  if (!(await canEditProposalSettings(ctx, proposal))) return ctx.reply("Only the proposal creator or an admin can edit this.");
+  if (proposal.launchpad !== "pumpfun") return ctx.reply("Fee sharing only applies to Pump.fun proposals.");
+  const feeShares = normalizeFeeShareSetting(value);
+  const updated = updateProposalFeeShares(id, feeShares);
+  return ctx.reply(feeSettingsMessage(updated ?? proposal), telegramReplyOptions);
+});
+
 bot.command("launchcheck", async (ctx) => {
   if (!(await isBotAdmin(ctx))) return ctx.reply("Admin command only.");
   const groupWallet =
@@ -644,6 +685,43 @@ bot.action(/^launch_me:(\d+)$/, async (ctx) => {
   runLaunchInBackground(ctx, () => runPersonalLaunch(ctx, Number(ctx.match[1])));
 });
 
+bot.action(/^cashback_toggle:(\d+)$/, async (ctx) => {
+  const proposal = getProposal(Number(ctx.match[1]));
+  if (!proposal) return safeAnswerCallback(ctx, "Proposal not found.");
+  if (!(await canEditProposalSettings(ctx, proposal))) return safeAnswerCallback(ctx, "Creator or admin only.");
+  const updated = updateProposalCashback(proposal.id, !proposal.pumpfunCashback);
+  await safeAnswerCallback(ctx, updated?.pumpfunCashback ? "Cashback enabled." : "Cashback disabled.");
+  await ctx.reply(feeSettingsMessage(updated ?? proposal), telegramReplyOptions);
+});
+
+bot.action(/^fees_menu:(\d+)$/, async (ctx) => {
+  const proposal = getProposal(Number(ctx.match[1]));
+  if (!proposal) return safeAnswerCallback(ctx, "Proposal not found.");
+  if (!(await canEditProposalSettings(ctx, proposal))) return safeAnswerCallback(ctx, "Creator or admin only.");
+  await safeAnswerCallback(ctx, "Fee settings.");
+  await ctx.reply(feeSettingsMessage(proposal), {
+    ...telegramReplyOptions,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "No Fee Sharing", callback_data: `fees_set:${proposal.id}:none` },
+          { text: "Creator 100%", callback_data: `fees_set:${proposal.id}:creator` }
+        ],
+        [{ text: "Custom Split", switch_inline_query_current_chat: `/setfees ${proposal.id} ` }]
+      ]
+    }
+  });
+});
+
+bot.action(/^fees_set:(\d+):(.+)$/, async (ctx) => {
+  const proposal = getProposal(Number(ctx.match[1]));
+  if (!proposal) return safeAnswerCallback(ctx, "Proposal not found.");
+  if (!(await canEditProposalSettings(ctx, proposal))) return safeAnswerCallback(ctx, "Creator or admin only.");
+  const updated = updateProposalFeeShares(proposal.id, normalizeFeeShareSetting(ctx.match[2]));
+  await safeAnswerCallback(ctx, "Fee settings updated.");
+  await ctx.reply(feeSettingsMessage(updated ?? proposal), telegramReplyOptions);
+});
+
 bot.action(/^wizard:(.+)$/, async (ctx) => {
   const action = ctx.match[1];
   const key = draftKey(ctx);
@@ -676,6 +754,20 @@ bot.action(/^wizard:(.+)$/, async (ctx) => {
     if (action.startsWith("devbuy:")) {
       draft.data.devBuySol = Number(action.split(":")[1]);
       await ctx.answerCbQuery("Dev buy set.");
+      await advanceWizard(ctx, draft, true);
+      return;
+    }
+
+    if (action.startsWith("cashback:")) {
+      draft.data.pumpfunCashback = action.endsWith(":on");
+      await ctx.answerCbQuery(draft.data.pumpfunCashback ? "Cashback enabled." : "Cashback disabled.");
+      await advanceWizard(ctx, draft, true);
+      return;
+    }
+
+    if (action.startsWith("fees:")) {
+      draft.data.pumpfunFeeShares = normalizeFeeShareSetting(action.split(":")[1]);
+      await ctx.answerCbQuery("Fee setting saved.");
       await advanceWizard(ctx, draft, true);
       return;
     }
@@ -997,6 +1089,58 @@ function priorityFeeForLaunchpad(launchpad: Launchpad): number {
   return config.DEFAULT_PRIORITY_FEE_SOL;
 }
 
+function parseOnOff(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (["on", "yes", "true", "1", "enable", "enabled"].includes(normalized)) return true;
+  if (["off", "no", "false", "0", "disable", "disabled"].includes(normalized)) return false;
+  throw new Error("Use on or off.");
+}
+
+function normalizeFeeShareSetting(value: string): string | undefined {
+  const normalized = value.trim();
+  const lower = normalized.toLowerCase();
+  if (lower === "none" || lower === "off" || lower === "no") return undefined;
+  if (lower === "creator" || lower === "creator:10000") return "creator:10000";
+
+  const total = normalized.split(",").reduce((sum, part) => {
+    const [, bpsText] = part.split(":");
+    const bps = Number(bpsText);
+    if (!Number.isInteger(bps) || bps <= 0) throw new Error("Custom fees must be wallet:bps pairs.");
+    return sum + bps;
+  }, 0);
+  if (total !== 10000) throw new Error(`Fee share bps must total 10000. Current total: ${total}.`);
+  return normalized;
+}
+
+async function canEditProposalSettings(ctx: Context, proposal: Proposal): Promise<boolean> {
+  return proposal.createdBy === ctx.from?.id || (await isBotAdmin(ctx));
+}
+
+function feeSettingsMessage(proposal: Proposal): string {
+  const fees = proposal.pumpfunFeeShares
+    ? proposal.pumpfunFeeShares === "creator:10000"
+      ? "Creator 100%"
+      : proposal.pumpfunFeeShares
+    : "None";
+
+  return [
+    `<b>Fee Settings #${proposal.id}</b>`,
+    "",
+    `<b>${escapeHtml(proposal.name)}</b> | <code>$${escapeHtml(proposal.symbol)}</code>`,
+    `Launchpad: <b>${proposal.launchpad === "pumpfun" ? "Pump.fun" : proposal.launchpad}</b>`,
+    `Cashback: <b>${proposal.pumpfunCashback ? "Enabled" : "Off"}</b>`,
+    `Fee sharing: <b>${escapeHtml(fees)}</b>`,
+    "",
+    "<b>Commands</b>",
+    `<code>/cashback ${proposal.id} on</code> or <code>/cashback ${proposal.id} off</code>`,
+    `<code>/setfees ${proposal.id} none</code>`,
+    `<code>/setfees ${proposal.id} creator</code>`,
+    `<code>/setfees ${proposal.id} WALLET1:8000,WALLET2:2000</code>`,
+    "",
+    "Fee sharing can lock Pump.fun reward distribution once configured."
+  ].join("\n");
+}
+
 function isTransientNetworkError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /timeout|timed out|aborted|ECONNRESET|ENOTFOUND|fetch failed|Connect Timeout/i.test(message);
@@ -1154,6 +1298,8 @@ async function applyWizardText(ctx: Context, draft: Draft, value: string): Promi
     const amount = Number(value);
     if (!Number.isFinite(amount) || amount <= 0) throw new Error("Send a valid SOL amount, like 0.01.");
     draft.data.devBuySol = amount;
+  } else if (draft.step === "feeShares") {
+    draft.data.pumpfunFeeShares = normalizeFeeShareSetting(value);
   }
 
   await advanceWizard(ctx, draft);
@@ -1193,7 +1339,9 @@ function nextDraftStep(draft: Draft): DraftStep {
   if (draft.step === "telegram") return "twitter";
   if (draft.step === "twitter") return "image";
   if (draft.step === "image") return "devBuy";
-  if (draft.step === "devBuy") return "preview";
+  if (draft.step === "devBuy") return draft.data.launchpad === "pumpfun" ? "cashback" : "preview";
+  if (draft.step === "cashback") return "feeShares";
+  if (draft.step === "feeShares") return "preview";
   return draft.step;
 }
 
@@ -1228,7 +1376,10 @@ function wizardQuestion(step: DraftStep): {
       "Reply to this message with the Telegram/community link, use this group, tap Skip, or send <code>/skip</code>.",
     twitter: "Reply to this message with the Twitter/X link, tap Skip, or send <code>/skip</code>.",
     image: "Reply with an image URL or upload the image as a reply. Image is required for launch metadata.",
-    devBuy: "Choose the dev buy amount, send a custom SOL amount, or use default."
+    devBuy: "Choose the dev buy amount, send a custom SOL amount, or use default.",
+    cashback: "Pump.fun cashback uses the V2 create flow. Enable it only if you want cashback on this launch.",
+    feeShares:
+      "Choose Pump.fun creator-fee sharing. This can lock reward distribution once configured. Send custom as <code>wallet:bps,wallet:bps</code> totaling 10000."
   };
 
   const skipButton = (field: string): InlineKeyboardButton => ({
@@ -1251,13 +1402,27 @@ function wizardQuestion(step: DraftStep): {
         { text: "Default", callback_data: "wizard:skip:devBuy" }
       ],
       [{ text: "❌ Cancel", callback_data: "wizard:cancel" }]
+    ],
+    cashback: [
+      [
+        { text: "Cashback On", callback_data: "wizard:cashback:on" },
+        { text: "Cashback Off", callback_data: "wizard:cashback:off" }
+      ],
+      [{ text: "❌ Cancel", callback_data: "wizard:cancel" }]
+    ],
+    feeShares: [
+      [
+        { text: "No Fee Sharing", callback_data: "wizard:fees:none" },
+        { text: "Creator 100%", callback_data: "wizard:fees:creator" }
+      ],
+      [{ text: "❌ Cancel", callback_data: "wizard:cancel" }]
     ]
   };
 
   return {
     text: wizardQuestionMessage(`Step: ${step}`, questions[step]),
     keyboard: keyboards[step],
-    forceReply: step === "name" || step === "symbol" || step === "description"
+    forceReply: step === "name" || step === "symbol" || step === "description" || step === "feeShares"
   };
 }
 
@@ -1503,6 +1668,12 @@ async function setupBotCommands(): Promise<void> {
     { command: "review", description: "Review pending launch ideas" },
     { command: "groupwallet", description: "Create/show the group launch wallet" },
     { command: "groupbalance", description: "Check the group launch wallet balance" },
+    { command: "mywallet", description: "Create/show your personal launch wallet" },
+    { command: "mybalance", description: "Check your personal wallet balance" },
+    { command: "launchme", description: "Launch your own Pump.fun proposal" },
+    { command: "feesettings", description: "Show proposal fee settings" },
+    { command: "cashback", description: "Set Pump.fun cashback on/off" },
+    { command: "setfees", description: "Set Pump.fun fee sharing" },
     { command: "exportgroupwallet", description: "DM admin: export a group wallet" },
     { command: "exportmywallet", description: "DM admin: export your personal wallet" },
     { command: "launchcheck", description: "Check launch readiness" },

@@ -117,7 +117,7 @@ export async function launchWithPumpFunSdk(
     proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL,
     priorityFeeForLaunchpad(proposal.launchpad)
   );
-  validatePumpFunFeeShares();
+  validatePumpFunFeeShares(proposal, signerKeypair.publicKey);
 
   const mintKeypair = getMintKeypair(proposal);
   const mintSigner = Keypair.fromSecretKey(bs58.decode(mintKeypair.secretKeyBase58));
@@ -128,7 +128,7 @@ export async function launchWithPumpFunSdk(
     console.log(`[launch:${proposal.id}] metadata ready: ${metadataUri}`);
 
     const signature = await sendPumpFunSdkCreateWithRetries(proposal, signerKeypair, mintSigner, mintKeypair, metadataUri);
-    const feeSharingMessage = await configurePumpFunFeeSharingIfEnabled(signerKeypair, mintSigner.publicKey).catch(
+    const feeSharingMessage = await configurePumpFunFeeSharingIfEnabled(proposal, signerKeypair, mintSigner.publicKey).catch(
       (error) => `\nFee sharing not locked: ${errorMessage(error)}`
     );
     if (mintKeypair.poolId) markVanityMintUsed(mintKeypair.poolId);
@@ -355,7 +355,7 @@ async function sendPumpFunSdkCreateRequest(
     amount: solAmount
   });
 
-  const createInstructions = config.PUMPFUN_CASHBACK
+  const createInstructions = (proposal.pumpfunCashback ?? config.PUMPFUN_CASHBACK)
     ? await sdk.createV2AndBuyInstructions({
         global,
         mint: mintSigner.publicKey,
@@ -428,8 +428,12 @@ async function sendPumpFunSdkCreateRequest(
   return signature;
 }
 
-async function configurePumpFunFeeSharingIfEnabled(signerKeypair: Keypair, mint: PublicKey): Promise<string> {
-  const shareholders = parsePumpFunFeeShares();
+async function configurePumpFunFeeSharingIfEnabled(
+  proposal: Proposal,
+  signerKeypair: Keypair,
+  mint: PublicKey
+): Promise<string> {
+  const shareholders = parsePumpFunFeeShares(proposal, signerKeypair.publicKey);
   if (shareholders.length === 0) return "";
 
   const connection = new Connection(config.SOLANA_RPC_URL, "confirmed");
@@ -472,20 +476,26 @@ async function configurePumpFunFeeSharingIfEnabled(signerKeypair: Keypair, mint:
   return `\nFee sharing locked: https://solscan.io/tx/${signature}`;
 }
 
-function validatePumpFunFeeShares(): void {
-  parsePumpFunFeeShares();
+function validatePumpFunFeeShares(proposal: Proposal, creatorAddress: PublicKey): void {
+  parsePumpFunFeeShares(proposal, creatorAddress);
 }
 
-function parsePumpFunFeeShares(): Array<{ address: PublicKey; shareBps: number }> {
-  const raw = config.PUMPFUN_FEE_SHARES.trim();
+function parsePumpFunFeeShares(
+  proposal: Proposal,
+  creatorAddress: PublicKey
+): Array<{ address: PublicKey; shareBps: number }> {
+  const raw = (proposal.pumpfunFeeShares ?? config.PUMPFUN_FEE_SHARES).trim();
   if (!raw) return [];
 
   const shares = raw.split(",").map((part) => {
-    const [addressText, bpsText] = part.split(":").map((value) => value?.trim());
+    let [addressText, bpsText] = part.split(":").map((value) => value?.trim());
     if (!addressText || !bpsText) {
       throw new NonRetryableLaunchError(
         "PUMPFUN_FEE_SHARES must use address:bps pairs, for example ADDRESS1:8000,ADDRESS2:2000."
       );
+    }
+    if (addressText.toLowerCase() === "creator") {
+      addressText = creatorAddress.toBase58();
     }
 
     const shareBps = Number(bpsText);

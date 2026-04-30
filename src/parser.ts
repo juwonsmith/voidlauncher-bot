@@ -21,7 +21,9 @@ export const ideaSchema = z.object({
       message: "Image must be a valid URL or Telegram upload."
     })
     .optional(),
-  devBuySol: z.number().positive().max(5).optional()
+  devBuySol: z.number().positive().max(5).optional(),
+  pumpfunCashback: z.boolean().optional(),
+  pumpfunFeeShares: z.string().max(500).optional()
 });
 
 export function parseIdea(text: string): CoinIdeaInput {
@@ -52,10 +54,20 @@ export function parseIdea(text: string): CoinIdeaInput {
     telegram: optional(fields.get("telegram")),
     twitter: optional(fields.get("twitter") ?? fields.get("x")),
     image: optional(fields.get("image")),
-    devBuySol: fields.get("devbuysol") ? Number(fields.get("devbuysol")) : undefined
+    devBuySol: fields.get("devbuysol") ? Number(fields.get("devbuysol")) : undefined,
+    pumpfunCashback: parseOptionalBoolean(fields.get("cashback") ?? fields.get("pumpfuncashback")),
+    pumpfunFeeShares: optional(fields.get("feeshares") ?? fields.get("pumpfunfeeshares"))
   };
 
   return ideaSchema.parse(rawIdea);
+}
+
+function parseOptionalBoolean(value: string | undefined): boolean | undefined {
+  if (!value) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (["true", "yes", "on", "1", "enabled"].includes(normalized)) return true;
+  if (["false", "no", "off", "0", "disabled"].includes(normalized)) return false;
+  throw new Error(`Invalid boolean value: ${value}`);
 }
 
 export function validateIdea(idea: Partial<CoinIdeaInput>): CoinIdeaInput {
