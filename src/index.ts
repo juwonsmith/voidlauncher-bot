@@ -15,6 +15,7 @@ import {
 } from "./db.js";
 import { launchProposal } from "./launchpads/index.js";
 import {
+  launchWithPumpFunSdk,
   launchWithPumpPortalApiKey,
   inspectLaunchOnchain,
   probePumpPortalLocalCreate,
@@ -514,7 +515,8 @@ bot.command("launchcheck", async (ctx) => {
     "<b>Launch Readiness</b>",
     "",
     `Mode: <b>${config.DRY_RUN ? "DRY RUN" : "LIVE"}</b>`,
-    `PumpPortal API key: <b>${config.PUMPPORTAL_API_KEY ? "SET" : "MISSING"}</b>`,
+    `Pump.fun SDK signer: <b>${config.PUMPFUN_SIGNER_PRIVATE_KEY ? "SET" : "MISSING"}</b>`,
+    `PumpPortal API key (Bonk): <b>${config.PUMPPORTAL_API_KEY ? "SET" : "MISSING"}</b>`,
     `Pinata JWT: <b>${config.PINATA_JWT ? "SET" : "MISSING"}</b>`,
     `Default dev buy: <b>${config.DEFAULT_DEV_BUY_SOL} SOL</b>`,
     `Slippage: <b>${config.DEFAULT_SLIPPAGE_PERCENT}%</b>`,
@@ -729,6 +731,7 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
 
   await withLaunchLock(ctx, `proposal:${id}`, async () => {
     const wallet = getPumpPortalApiKey("group", String(chatId));
+    const exportedWallet = proposal.launchpad === "pumpfun" ? exportPumpPortalWallet("group", String(chatId)) : undefined;
     if (!config.DRY_RUN) {
       await assertGroupLaunchReady(proposal, String(chatId), wallet.address);
     }
@@ -752,7 +755,7 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
           })()
         : proposal.launchpad === "bonk"
           ? await launchWithPumpPortalApiKey(proposal, wallet.apiKey)
-          : await launchWithPumpPortalApiKey(proposal, wallet.apiKey);
+          : await launchWithPumpFunSdk(proposal, exportedWallet?.secretKey ?? "", wallet.address);
     if (!result.dryRun) markLaunched(id, result.signature);
     await replyLaunchResult(ctx, result);
   });
@@ -834,7 +837,10 @@ async function assertApiLaunchReady(proposal: Proposal): Promise<void> {
   if (proposal.launchpad === "bags") {
     problems.push("Bags launches must use Launch Group");
   }
-  if (!config.PUMPPORTAL_API_KEY) problems.push("PUMPPORTAL_API_KEY is missing");
+  if (proposal.launchpad === "pumpfun" && !config.PUMPFUN_SIGNER_PRIVATE_KEY) {
+    problems.push("PUMPFUN_SIGNER_PRIVATE_KEY is missing");
+  }
+  if (proposal.launchpad === "bonk" && !config.PUMPPORTAL_API_KEY) problems.push("PUMPPORTAL_API_KEY is missing");
   if (proposal.launchpad === "pumpfun" && !config.PINATA_JWT) problems.push("PINATA_JWT is missing");
   if (!proposal.image) problems.push("proposal has no image");
   if (suffix && countAvailableVanityMints(suffix) < 1) {

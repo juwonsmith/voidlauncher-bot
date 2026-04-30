@@ -15,6 +15,7 @@ const envSchema = z.object({
     .string()
     .default("true")
     .transform((value) => value.toLowerCase() !== "false"),
+  PUMPFUN_SIGNER_PRIVATE_KEY: z.string().optional(),
   PUMPPORTAL_API_KEY: z.string().optional(),
   BAGS_API_KEY: z.string().optional(),
   PINATA_JWT: z.string().optional(),

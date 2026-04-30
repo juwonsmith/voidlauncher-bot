@@ -1,4 +1,13 @@
-import { Connection, Keypair, VersionedTransaction } from "@solana/web3.js";
+import { getBuyTokenAmountFromSolAmount, OnlinePumpSdk, PumpSdk } from "@pump-fun/pump-sdk";
+import {
+  ComputeBudgetProgram,
+  Connection,
+  Keypair,
+  LAMPORTS_PER_SOL,
+  Transaction,
+  VersionedTransaction
+} from "@solana/web3.js";
+import BN from "bn.js";
 import bs58 from "bs58";
 import nacl from "tweetnacl";
 import { config } from "../config.js";
@@ -31,8 +40,15 @@ class NonRetryableLaunchError extends Error {}
 class UnlandedLaunchError extends Error {}
 
 export async function launchWithPumpPortal(proposal: Proposal): Promise<LaunchResult> {
+  if (proposal.launchpad === "pumpfun") {
+    if (!config.PUMPFUN_SIGNER_PRIVATE_KEY) {
+      throw new Error("PUMPFUN_SIGNER_PRIVATE_KEY is required for Pump.fun SDK launches outside group wallets.");
+    }
+    return launchWithPumpFunSdk(proposal, config.PUMPFUN_SIGNER_PRIVATE_KEY);
+  }
+
   if (!config.PUMPPORTAL_API_KEY) {
-    throw new Error("PUMPPORTAL_API_KEY is required when DRY_RUN=false.");
+    throw new Error("PUMPPORTAL_API_KEY is required for Bonk launches when DRY_RUN=false.");
   }
   return launchWithPumpPortalApiKey(proposal, config.PUMPPORTAL_API_KEY);
 }
@@ -46,6 +62,10 @@ export async function launchWithPumpPortalApiKey(proposal: Proposal, pumpPortalA
     return launchBonkWithFreshMints(proposal, pumpPortalApiKey);
   }
 
+  if (proposal.launchpad === "pumpfun") {
+    throw new Error("Pump.fun launches now use the official Pump.fun SDK. Use group wallet launch or set PUMPFUN_SIGNER_PRIVATE_KEY.");
+  }
+
   const mintKeypair = getMintKeypair(proposal);
 
   try {
@@ -54,6 +74,58 @@ export async function launchWithPumpPortalApiKey(proposal: Proposal, pumpPortalA
 
     console.log(`[launch:${proposal.id}] metadata ready: ${metadataUri}`);
     const signature = await sendCreateWithRetries(proposal, mintKeypair, metadataUri, pumpPortalApiKey);
+    if (mintKeypair.poolId) markVanityMintUsed(mintKeypair.poolId);
+
+    return {
+      launchpad: proposal.launchpad,
+      dryRun: false,
+      mint: mintKeypair.address,
+      signature,
+      explorerUrl: `https://solscan.io/tx/${signature}`,
+      metadataUri,
+      message: `Launched ${proposal.name} ($${proposal.symbol}).`
+    };
+  } catch (error) {
+    if (mintKeypair.poolId) {
+      if (error instanceof UnknownConfirmationError) markVanityMintUsed(mintKeypair.poolId);
+      else releaseVanityMint(mintKeypair.poolId);
+    }
+    throw error;
+  }
+}
+
+export async function launchWithPumpFunSdk(
+  proposal: Proposal,
+  signerSecretKeyBase58: string,
+  signerAddress?: string
+): Promise<LaunchResult> {
+  if (!proposal.image) {
+    throw new Error("An image URL is required for Pump.fun metadata.");
+  }
+  if (proposal.launchpad !== "pumpfun") {
+    throw new Error("Official Pump.fun SDK launch only supports Pump.fun proposals.");
+  }
+
+  const signerKeypair = Keypair.fromSecretKey(bs58.decode(signerSecretKeyBase58));
+  if (signerAddress && signerKeypair.publicKey.toBase58() !== signerAddress) {
+    throw new Error("Signer wallet secret does not match wallet address.");
+  }
+
+  await assertLocalWalletFunded(
+    signerKeypair.publicKey.toBase58(),
+    proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL,
+    priorityFeeForLaunchpad(proposal.launchpad)
+  );
+
+  const mintKeypair = getMintKeypair(proposal);
+  const mintSigner = Keypair.fromSecretKey(bs58.decode(mintKeypair.secretKeyBase58));
+
+  try {
+    console.log(`[launch:${proposal.id}] preparing Pump.fun SDK metadata`);
+    const metadataUri = await uploadPumpMetadataToPinata(proposal);
+    console.log(`[launch:${proposal.id}] metadata ready: ${metadataUri}`);
+
+    const signature = await sendPumpFunSdkCreateWithRetries(proposal, signerKeypair, mintSigner, mintKeypair, metadataUri);
     if (mintKeypair.poolId) markVanityMintUsed(mintKeypair.poolId);
 
     return {
@@ -219,6 +291,122 @@ async function sendLocalCreateWithRetries(
   }
 
   throw new Error(`Local launch failed after ${config.LAUNCH_MAX_ATTEMPTS} attempts: ${errorMessage(lastError)}`);
+}
+
+async function sendPumpFunSdkCreateWithRetries(
+  proposal: Proposal,
+  signerKeypair: Keypair,
+  mintSigner: Keypair,
+  mintKeypair: MintKeypair,
+  metadataUri: string
+): Promise<string> {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= config.LAUNCH_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      console.log(`[launch:${proposal.id}] sending Pump.fun SDK create (${attempt}/${config.LAUNCH_MAX_ATTEMPTS})`);
+      const signature = await sendPumpFunSdkCreateRequest(proposal, signerKeypair, mintSigner, mintKeypair, metadataUri);
+      console.log(`[launch:${proposal.id}] Pump.fun SDK launch signature: ${signature}`);
+      await waitForSubmittedOrConfirmedSignature(signature, proposal, mintKeypair.address);
+      return signature;
+    } catch (error) {
+      if (error instanceof UnknownConfirmationError || error instanceof NonRetryableLaunchError) throw error;
+      lastError = error;
+      console.warn(
+        `[launch:${proposal.id}] Pump.fun SDK attempt ${attempt}/${config.LAUNCH_MAX_ATTEMPTS} failed: ${errorMessage(
+          error
+        )}`
+      );
+      if (attempt < config.LAUNCH_MAX_ATTEMPTS) await delay(config.LAUNCH_RETRY_DELAY_MS);
+    }
+  }
+
+  throw new Error(`Pump.fun SDK launch failed after ${config.LAUNCH_MAX_ATTEMPTS} attempts: ${errorMessage(lastError)}`);
+}
+
+async function sendPumpFunSdkCreateRequest(
+  proposal: Proposal,
+  signerKeypair: Keypair,
+  mintSigner: Keypair,
+  mintKeypair: MintKeypair,
+  metadataUri: string
+): Promise<string> {
+  const mintAddress = mintSigner.publicKey.toBase58();
+  if (mintAddress !== mintKeypair.address) {
+    throw new Error(`Prepared mint address mismatch: ${mintKeypair.address} != ${mintAddress}.`);
+  }
+
+  const connection = new Connection(config.SOLANA_RPC_URL, "confirmed");
+  const onlineSdk = new OnlinePumpSdk(connection);
+  const sdk = new PumpSdk();
+  const global = await onlineSdk.fetchGlobal();
+  const devBuyLamports = Math.round((proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL) * LAMPORTS_PER_SOL);
+  const solAmount = new BN(devBuyLamports);
+  const tokenAmount = getBuyTokenAmountFromSolAmount({
+    global,
+    feeConfig: null,
+    mintSupply: null,
+    bondingCurve: null,
+    amount: solAmount
+  });
+
+  const createInstructions = await sdk.createAndBuyInstructions({
+    global,
+    mint: mintSigner.publicKey,
+    name: proposal.name,
+    symbol: proposal.symbol,
+    uri: metadataUri,
+    creator: signerKeypair.publicKey,
+    user: signerKeypair.publicKey,
+    solAmount,
+    amount: tokenAmount
+  });
+
+  const computeUnitLimit = 450_000;
+  const priorityMicroLamports = Math.max(
+    1,
+    Math.ceil((priorityFeeForLaunchpad(proposal.launchpad) * LAMPORTS_PER_SOL * 1_000_000) / computeUnitLimit)
+  );
+  const transaction = new Transaction().add(
+    ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnitLimit }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityMicroLamports }),
+    ...createInstructions
+  );
+  transaction.feePayer = signerKeypair.publicKey;
+  const latestBlockhash = await connection.getLatestBlockhash("confirmed");
+  transaction.recentBlockhash = latestBlockhash.blockhash;
+  transaction.sign(signerKeypair, mintSigner);
+
+  const simulation = await connection.simulateTransaction(transaction);
+  if (simulation.value.err) {
+    throw new NonRetryableLaunchError(
+      `Pump.fun SDK simulation failed: ${JSON.stringify(simulation.value.err)}${
+        simulation.value.logs?.length ? ` | logs: ${simulation.value.logs.slice(-8).join(" | ")}` : ""
+      }`
+    );
+  }
+
+  const signature = await connection.sendRawTransaction(transaction.serialize(), {
+    maxRetries: 3,
+    skipPreflight: false
+  });
+
+  const confirmation = await connection.confirmTransaction(
+    {
+      signature,
+      blockhash: latestBlockhash.blockhash,
+      lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
+    },
+    "confirmed"
+  );
+  if (confirmation.value.err) {
+    throw new Error(
+      `Pump.fun SDK transaction failed on-chain: ${JSON.stringify(confirmation.value.err)}. ` +
+        `Solscan: https://solscan.io/tx/${signature}`
+    );
+  }
+
+  return signature;
 }
 
 async function sendLocalCreateRequest(
