@@ -278,6 +278,7 @@ bot.on("text", async (ctx, next) => {
 
   try {
     await applyWizardText(ctx, draft, ctx.message.text.trim());
+    await safeDeleteWizardInput(ctx, ctx.message.message_id);
   } catch (error) {
     await ctx.reply(formatError(error), telegramReplyOptions);
   }
@@ -310,6 +311,7 @@ bot.on("photo", async (ctx, next) => {
 
   draft.data.image = `telegram:${photo.file_id}`;
   await advanceWizard(ctx, draft);
+  await safeDeleteWizardInput(ctx, ctx.message.message_id);
 });
 
 bot.command("review", async (ctx) => {
@@ -1369,6 +1371,11 @@ async function safeDeleteMessage(ctx: Context, messageId: number | undefined): P
   } catch {
     // Ignore Telegram delete failures for old messages or missing bot permissions.
   }
+}
+
+async function safeDeleteWizardInput(ctx: Context, messageId: number | undefined): Promise<void> {
+  if (ctx.chat?.type === "private") return;
+  await safeDeleteMessage(ctx, messageId);
 }
 
 async function safeEditMessageText(ctx: Context, text: string, keyboard: InlineKeyboardButton[][]): Promise<void> {
