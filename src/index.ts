@@ -105,6 +105,39 @@ bot.command("commands", (ctx) => {
   return ctx.reply(commandHelpMessage(), telegramReplyOptions);
 });
 
+bot.command("deletecheck", async (ctx) => {
+  if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup") {
+    return ctx.reply("Use /deletecheck inside the Telegram group.");
+  }
+  if (!(await isBotAdmin(ctx))) return ctx.reply("Admin command only.");
+
+  const me = await ctx.telegram.getMe();
+  const member = await ctx.telegram.getChatMember(ctx.chat.id, me.id);
+  const canDelete =
+    member.status === "creator" ||
+    (member.status === "administrator" && Boolean((member as { can_delete_messages?: boolean }).can_delete_messages));
+
+  const testMessage = await ctx.reply("Delete check: testing bot delete permission...");
+  const botMessageDeleted = await safeDeleteMessage(ctx, testMessage.message_id, "deletecheck bot message");
+  const commandMessageDeleted = await safeDeleteMessage(ctx, ctx.message.message_id, "deletecheck command message");
+
+  return ctx.reply(
+    [
+      "<b>Delete Check</b>",
+      "",
+      `Bot admin status: <b>${escapeHtml(member.status)}</b>`,
+      `Delete permission: <b>${canDelete ? "yes" : "no"}</b>`,
+      `Deleted bot test message: <b>${botMessageDeleted ? "yes" : "no"}</b>`,
+      `Deleted command message: <b>${commandMessageDeleted ? "yes" : "no"}</b>`,
+      "",
+      canDelete
+        ? "If command deletion says no, check the bot logs for Telegram's exact error."
+        : "Enable admin permission: Delete messages."
+    ].join("\n"),
+    telegramReplyOptions
+  );
+});
+
 bot.command("groupwallet", async (ctx) => {
   if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup") {
     return ctx.reply("Use this command inside a Telegram group.");
@@ -711,7 +744,7 @@ async function runApiLaunch(ctx: Context, id: number): Promise<void> {
 
     const result = await launchProposal(proposal);
     if (!result.dryRun) markLaunched(id, result.signature);
-    await safeDeleteMessage(ctx, progressMessage.message_id);
+    await safeDeleteMessage(ctx, progressMessage.message_id, "API launch progress");
     await replyLaunchResult(ctx, result);
   });
 }
@@ -757,7 +790,7 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
           ? await launchWithPumpPortalApiKey(proposal, wallet.apiKey)
           : await launchWithPumpFunSdk(proposal, exportedWallet?.secretKey ?? "", wallet.address);
     if (!result.dryRun) markLaunched(id, result.signature);
-    await safeDeleteMessage(ctx, progressMessage.message_id);
+    await safeDeleteMessage(ctx, progressMessage.message_id, "group launch progress");
     await replyLaunchResult(ctx, result);
   });
 }
@@ -802,7 +835,7 @@ async function runPersonalLaunch(ctx: Context, id: number): Promise<void> {
       : await launchWithPumpFunSdk(proposal, exportWalletSecretBase58("user", String(ctx.from!.id)).secretKey, wallet.address);
 
     if (!result.dryRun) markLaunched(id, result.signature);
-    await safeDeleteMessage(ctx, progressMessage.message_id);
+    await safeDeleteMessage(ctx, progressMessage.message_id, "personal launch progress");
     await replyLaunchResult(ctx, result);
   });
 }
@@ -1140,13 +1173,13 @@ async function advanceWizard(ctx: Context, draft: Draft, edit = false): Promise<
 
   if (draft.step === "preview") {
     const idea = validateIdea(draft.data);
-    if (!edit) await safeDeleteMessage(ctx, previousPromptMessageId);
+    if (!edit) await safeDeleteMessage(ctx, previousPromptMessageId, "previous wizard prompt");
     draft.promptMessageId = await sendWizardMessage(ctx, wizardPreviewMessage(idea), wizardPreviewKeyboard(), false, edit);
     return;
   }
 
   const question = wizardQuestion(draft.step);
-  if (!edit) await safeDeleteMessage(ctx, previousPromptMessageId);
+  if (!edit) await safeDeleteMessage(ctx, previousPromptMessageId, "previous wizard prompt");
   draft.promptMessageId = await sendWizardMessage(ctx, question.text, question.keyboard, question.forceReply, edit);
 }
 
@@ -1363,19 +1396,21 @@ async function safeAnswerCallback(ctx: Context, text: string): Promise<void> {
   }
 }
 
-async function safeDeleteMessage(ctx: Context, messageId: number | undefined): Promise<void> {
-  if (!messageId || !ctx.chat?.id) return;
+async function safeDeleteMessage(ctx: Context, messageId: number | undefined, label = "message"): Promise<boolean> {
+  if (!messageId || !ctx.chat?.id) return false;
 
   try {
     await ctx.telegram.deleteMessage(ctx.chat.id, messageId);
-  } catch {
-    // Ignore Telegram delete failures for old messages or missing bot permissions.
+    return true;
+  } catch (error) {
+    console.warn(`Could not delete ${label} ${messageId}`, error);
+    return false;
   }
 }
 
 async function safeDeleteWizardInput(ctx: Context, messageId: number | undefined): Promise<void> {
   if (ctx.chat?.type === "private") return;
-  await safeDeleteMessage(ctx, messageId);
+  await safeDeleteMessage(ctx, messageId, "wizard input");
 }
 
 async function safeEditMessageText(ctx: Context, text: string, keyboard: InlineKeyboardButton[][]): Promise<void> {
