@@ -1,0 +1,12 @@
+node_modules/
+dist/
+data/
+.env
+*.log
+*.db
+*.sqlite
+*.sqlite3
+privacy-policy-site/
+target/
+rust/vanity-worker/target/
+rust/vanity-worker/target-check/

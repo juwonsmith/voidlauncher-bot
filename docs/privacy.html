@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VoidLauncher Privacy Policy</title>
+    <meta
+      name="description"
+      content="Privacy Policy for VoidLauncher, a Telegram bot for group token launch proposals."
+    />
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #070a0f;
+        --panel: #101722;
+        --text: #eef5f7;
+        --muted: #a9b8c3;
+        --line: #243244;
+        --accent: #20e0a4;
+        --accent-2: #4db7ff;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background:
+          radial-gradient(circle at top left, rgba(32, 224, 164, 0.16), transparent 34rem),
+          radial-gradient(circle at top right, rgba(77, 183, 255, 0.14), transparent 30rem),
+          var(--bg);
+        color: var(--text);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+        line-height: 1.65;
+      }
+
+      main {
+        width: min(920px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 56px 0 72px;
+      }
+
+      header {
+        padding-bottom: 28px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        color: var(--accent);
+        font-weight: 800;
+        letter-spacing: 0;
+      }
+
+      .mark {
+        display: grid;
+        place-items: center;
+        width: 34px;
+        height: 34px;
+        border: 1px solid rgba(32, 224, 164, 0.45);
+        border-radius: 50%;
+        background: rgba(32, 224, 164, 0.09);
+      }
+
+      h1 {
+        margin: 20px 0 8px;
+        font-size: clamp(2rem, 5vw, 3.75rem);
+        line-height: 1.05;
+        letter-spacing: 0;
+      }
+
+      .effective {
+        margin: 0;
+        color: var(--muted);
+      }
+
+      section {
+        padding: 30px 0;
+        border-bottom: 1px solid rgba(36, 50, 68, 0.72);
+      }
+
+      h2 {
+        margin: 0 0 12px;
+        font-size: 1.18rem;
+        letter-spacing: 0;
+      }
+
+      p {
+        margin: 0 0 14px;
+        color: var(--muted);
+      }
+
+      ul {
+        margin: 12px 0 0;
+        padding-left: 22px;
+        color: var(--muted);
+      }
+
+      li {
+        margin: 8px 0;
+      }
+
+      a {
+        color: var(--accent-2);
+      }
+
+      .notice {
+        margin-top: 24px;
+        padding: 18px;
+        border: 1px solid rgba(32, 224, 164, 0.25);
+        border-radius: 8px;
+        background: rgba(16, 23, 34, 0.82);
+      }
+
+      footer {
+        padding-top: 28px;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="brand">
+          <span class="mark">V</span>
+          <span>VoidLauncher</span>
+        </div>
+        <h1>Privacy Policy</h1>
+        <p class="effective">Effective date: April 29, 2026</p>
+        <p class="notice">
+          VoidLauncher is a Telegram bot that helps Telegram groups create, review, approve,
+          and launch token proposals on supported launchpads such as Pump.fun and Bonk.
+        </p>
+      </header>
+
+      <section>
+        <h2>Information We Collect</h2>
+        <p>When you use VoidLauncher, the bot may collect and store:</p>
+        <ul>
+          <li>Your Telegram user ID, username, first name, and basic Telegram profile details provided by Telegram.</li>
+          <li>Telegram group IDs and group titles where the bot is added.</li>
+          <li>Token proposal details submitted through the bot, including name, symbol, description, links, images, launchpad choice, and dev buy amount.</li>
+          <li>Approval, rejection, and launch status for proposals.</li>
+          <li>Wallet addresses created or used by the bot.</li>
+          <li>Encrypted private keys for bot-created group or personal launch wallets, if wallet features are enabled.</li>
+          <li>Transaction signatures, token contract addresses, launch metadata URLs, and related public blockchain data.</li>
+          <li>Bot logs needed for debugging, abuse prevention, uptime, and launch troubleshooting.</li>
+        </ul>
+        <p>VoidLauncher does not intentionally collect passwords, seed phrases, or unrelated private messages.</p>
+      </section>
+
+      <section>
+        <h2>How We Use Information</h2>
+        <p>We use collected information to run bot features, manage proposals, verify admin actions, create and manage launch wallets, submit launch requests, show launch status, prevent unauthorized use, and debug reliability issues.</p>
+      </section>
+
+      <section>
+        <h2>Wallets And Private Keys</h2>
+        <p>If VoidLauncher creates a wallet, the wallet private key is stored encrypted by the bot.</p>
+        <p>Private keys are not shown in group chats. Export commands are designed to work only in private Telegram DMs and only for authorized users.</p>
+        <p>Anyone who receives an exported private key controls that wallet and its funds. Keep exported keys secure and never share them publicly.</p>
+      </section>
+
+      <section>
+        <h2>Third-Party Services</h2>
+        <p>VoidLauncher may send necessary data to third-party services to perform launches and related features, including Telegram, PumpPortal, Pinata or other IPFS services, Solana RPC providers such as Helius, and public blockchain explorers or trading tools.</p>
+        <p>These services may process data according to their own privacy policies.</p>
+      </section>
+
+      <section>
+        <h2>Public Blockchain Data</h2>
+        <p>Token launches, wallet addresses, contract addresses, and transaction signatures are public on the Solana blockchain. Once submitted on-chain, this information cannot be deleted by VoidLauncher.</p>
+      </section>
+
+      <section>
+        <h2>Group Admin Access</h2>
+        <p>If group-admin permissions are enabled, Telegram group admins may be able to approve, reject, or launch proposals from that group.</p>
+        <p>Only add VoidLauncher to groups where you trust the admins who may control launch actions.</p>
+      </section>
+
+      <section>
+        <h2>Data Retention</h2>
+        <p>VoidLauncher stores proposal, wallet, and launch records for as long as needed to operate the bot, maintain launch history, debug issues, and support wallet recovery/export features.</p>
+        <p>Bot operators may delete old records when they are no longer needed, unless retention is required for security, troubleshooting, or operational reasons.</p>
+      </section>
+
+      <section>
+        <h2>Data Security</h2>
+        <p>We use reasonable technical measures to protect stored data, including encryption for stored wallet private keys when wallet features are enabled.</p>
+        <p>No system is completely secure. Users are responsible for protecting exported private keys, Telegram accounts, bot tokens, API keys, and admin access.</p>
+      </section>
+
+      <section>
+        <h2>User Controls</h2>
+        <p>Users and group admins may stop using the bot, remove it from a group, delete bot messages where Telegram permissions allow, and ask the bot operator to remove stored records where practical.</p>
+        <p>Public blockchain transactions and public IPFS metadata may not be removable after launch.</p>
+      </section>
+
+      <section>
+        <h2>Children</h2>
+        <p>VoidLauncher is not intended for children. Users must follow Telegram's terms and any applicable laws in their jurisdiction.</p>
+      </section>
+
+      <section>
+        <h2>Changes To This Policy</h2>
+        <p>This Privacy Policy may be updated as the bot changes. The latest version should be made available through the bot profile, website, or official project channel.</p>
+      </section>
+
+      <section>
+        <h2>Contact</h2>
+        <p>For privacy questions or data requests, contact the VoidLauncher operator: <a href="https://t.me/walkerthedev">@walkerthedev</a>.</p>
+      </section>
+
+      <footer>VoidLauncher Privacy Policy</footer>
+    </main>
+  </body>
+</html>
