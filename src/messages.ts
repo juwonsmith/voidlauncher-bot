@@ -93,6 +93,7 @@ export function proposalKeyboard(proposal: Proposal): InlineKeyboardButton[][] {
     } else {
       rows.push([
         { text: "Launch Group", callback_data: `launch_group:${proposal.id}` },
+        { text: "Launch Me", callback_data: `launch_me:${proposal.id}` },
         { text: "Launch API", callback_data: `launch:${proposal.id}` }
       ]);
     }
@@ -119,9 +120,12 @@ export function commandHelpMessage(): string {
     "<code>/approve &lt;id&gt;</code> - approve an idea",
     "<code>/reject &lt;id&gt; reason</code> - reject an idea",
     "<code>/launchgroup &lt;id&gt;</code> - launch with the group wallet",
+    "<code>/launchme &lt;id&gt;</code> - launch your own Pump.fun proposal with your personal wallet",
     "<code>/launchcheck</code> - check production readiness",
     "<code>/groupwallet</code> - create/show group wallet",
     "<code>/groupbalance</code> - check group wallet balance",
+    "<code>/mywallet</code> - create/show your personal launch wallet",
+    "<code>/mybalance</code> - check your personal wallet balance",
     "<code>/txcheck &lt;signature&gt; [ca]</code> - inspect a launch transaction",
     "",
     "<b>Admin DM Only</b>",

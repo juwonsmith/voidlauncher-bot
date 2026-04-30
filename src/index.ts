@@ -477,7 +477,6 @@ bot.command("launch", async (ctx) => {
   const id = parseIdArg(ctx.message.text);
   if (!id) return ctx.reply("Usage: /launch <proposal_id>");
 
-  await ctx.reply(config.DRY_RUN ? `Starting dry API launch for #${id}...` : `Starting API launch for #${id}...`);
   runLaunchInBackground(ctx, () => runApiLaunch(ctx, id));
 });
 
@@ -490,7 +489,6 @@ bot.command("launchgroup", async (ctx) => {
   const id = parseIdArg(ctx.message.text);
   if (!id) return ctx.reply("Usage: /launchgroup <proposal_id>");
 
-  await ctx.reply(config.DRY_RUN ? `Starting dry group launch for #${id}...` : `Starting group launch for #${id}...`);
   runLaunchInBackground(ctx, () => runGroupLaunch(ctx, id));
 });
 
@@ -500,7 +498,6 @@ bot.command("launchme", async (ctx) => {
   const id = parseIdArg(ctx.message.text);
   if (!id) return ctx.reply("Usage: /launchme <proposal_id>");
 
-  await ctx.reply(config.DRY_RUN ? `Starting dry personal launch for #${id}...` : `Starting personal launch for #${id}...`);
   runLaunchInBackground(ctx, () => runPersonalLaunch(ctx, id));
 });
 
@@ -703,7 +700,7 @@ async function runApiLaunch(ctx: Context, id: number): Promise<void> {
       await assertApiLaunchReady(proposal);
     }
 
-    await ctx.reply(
+    const progressMessage = await ctx.reply(
       config.DRY_RUN
         ? `&#129514; <b>Running dry launch for #${id}...</b>`
         : `&#128640; <b>Starting API launch for #${id}...</b>\nThis can take a moment while metadata uploads.`,
@@ -712,6 +709,7 @@ async function runApiLaunch(ctx: Context, id: number): Promise<void> {
 
     const result = await launchProposal(proposal);
     if (!result.dryRun) markLaunched(id, result.signature);
+    await safeDeleteMessage(ctx, progressMessage.message_id);
     await replyLaunchResult(ctx, result);
   });
 }
@@ -736,7 +734,7 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
       await assertGroupLaunchReady(proposal, String(chatId), wallet.address);
     }
 
-    await ctx.reply(
+    const progressMessage = await ctx.reply(
       config.DRY_RUN
         ? `&#129514; <b>Running dry group launch for #${id}...</b>`
         : `&#128640; <b>Starting group-wallet launch for #${id}...</b>\nThis can take a moment while metadata uploads.`,
@@ -757,6 +755,7 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
           ? await launchWithPumpPortalApiKey(proposal, wallet.apiKey)
           : await launchWithPumpFunSdk(proposal, exportedWallet?.secretKey ?? "", wallet.address);
     if (!result.dryRun) markLaunched(id, result.signature);
+    await safeDeleteMessage(ctx, progressMessage.message_id);
     await replyLaunchResult(ctx, result);
   });
 }
@@ -766,10 +765,44 @@ async function runPersonalLaunch(ctx: Context, id: number): Promise<void> {
     await ctx.reply("I could not identify you.");
     return;
   }
-  await ctx.reply(
-    "Personal-wallet token creation is disabled for now because PumpPortal's Local Transaction API docs only support buy/sell on trade-local. Use the Launch API button for creation.",
-    telegramReplyOptions
-  );
+
+  const proposal = getProposal(id);
+  if (!proposal) return void (await ctx.reply(`Proposal #${id} not found.`));
+  if (proposal.status === "launched" || proposal.status === "rejected") {
+    return void (await ctx.reply(`Proposal #${id} is ${proposal.status}.`));
+  }
+  if (proposal.createdBy !== ctx.from.id && !(await isBotAdmin(ctx))) {
+    return void (await ctx.reply("You can only personal-launch your own proposal."));
+  }
+  if (proposal.launchpad !== "pumpfun") {
+    return void (await ctx.reply("Personal launch currently supports Pump.fun only. Use group/API launch for Bonk."));
+  }
+
+  await withLaunchLock(ctx, `personal:${ctx.from.id}:${id}`, async () => {
+    const wallet = await getOrCreateWallet("user", String(ctx.from!.id));
+    if (!config.DRY_RUN) {
+      await assertPersonalLaunchReady(proposal, wallet.address);
+    }
+
+    const progressMessage = await ctx.reply(
+      config.DRY_RUN
+        ? `&#129514; <b>Running dry personal launch for #${id}...</b>`
+        : `&#128640; <b>Starting personal-wallet launch for #${id}...</b>\nThis can take a moment while metadata uploads.`,
+      telegramReplyOptions
+    );
+
+    const result = config.DRY_RUN
+      ? {
+          launchpad: proposal.launchpad,
+          dryRun: true,
+          message: `Dry run only. Would launch ${proposal.name} ($${proposal.symbol}) from personal wallet ${wallet.address}.`
+        }
+      : await launchWithPumpFunSdk(proposal, exportWalletSecretBase58("user", String(ctx.from!.id)).secretKey, wallet.address);
+
+    if (!result.dryRun) markLaunched(id, result.signature);
+    await safeDeleteMessage(ctx, progressMessage.message_id);
+    await replyLaunchResult(ctx, result);
+  });
 }
 
 async function assertGroupLaunchReady(proposal: Proposal, groupId: string, walletAddress: string): Promise<void> {
@@ -827,6 +860,56 @@ async function assertGroupLaunchReady(proposal: Proposal, groupId: string, walle
 
   if (problems.length > 0) {
     throw new Error(`Launch preflight failed:\n- ${problems.join("\n- ")}`);
+  }
+}
+
+async function assertPersonalLaunchReady(proposal: Proposal, walletAddress: string): Promise<void> {
+  const problems: string[] = [];
+  const suffix = mintSuffixForLaunchpad(proposal.launchpad);
+  const devBuySol = proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL;
+  const priorityFeeSol = priorityFeeForLaunchpad(proposal.launchpad);
+  const requiredSol = devBuySol + priorityFeeSol + config.LOCAL_LAUNCH_MIN_SOL_BUFFER;
+
+  if (proposal.launchpad !== "pumpfun") problems.push("personal launch currently supports Pump.fun only");
+  if (!proposal.image) problems.push("proposal has no image");
+  if (!config.PINATA_JWT) problems.push("PINATA_JWT is missing");
+  if (suffix && countAvailableVanityMints(suffix) < 1) {
+    problems.push(`no ${proposal.launchpad} vanity mints available for suffix "${suffix}"`);
+  }
+
+  try {
+    const balance = await getSolBalance(walletAddress);
+    if (balance < requiredSol) {
+      problems.push(
+        `personal wallet has ${balance.toFixed(6)} SOL; needs at least ${requiredSol.toFixed(6)} SOL for dev buy, fees, and rent`
+      );
+    }
+  } catch (error) {
+    console.warn(
+      `[preflight:${proposal.id}] could not read personal wallet balance from RPC: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  }
+
+  if (proposal.image) {
+    try {
+      await testLaunchImageFetch(proposal);
+    } catch (error) {
+      if (isTransientNetworkError(error)) {
+        console.warn(
+          `[preflight:${proposal.id}] image fetch check skipped due network timeout: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      } else {
+        problems.push(`image is not launch-ready: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+
+  if (problems.length > 0) {
+    throw new Error(`Personal launch preflight failed:\n- ${problems.join("\n- ")}`);
   }
 }
 
@@ -1050,15 +1133,18 @@ function assertUrl(value: string, label: string): void {
 }
 
 async function advanceWizard(ctx: Context, draft: Draft, edit = false): Promise<void> {
+  const previousPromptMessageId = draft.promptMessageId;
   draft.step = nextDraftStep(draft);
 
   if (draft.step === "preview") {
     const idea = validateIdea(draft.data);
+    if (!edit) await safeDeleteMessage(ctx, previousPromptMessageId);
     draft.promptMessageId = await sendWizardMessage(ctx, wizardPreviewMessage(idea), wizardPreviewKeyboard(), false, edit);
     return;
   }
 
   const question = wizardQuestion(draft.step);
+  if (!edit) await safeDeleteMessage(ctx, previousPromptMessageId);
   draft.promptMessageId = await sendWizardMessage(ctx, question.text, question.keyboard, question.forceReply, edit);
 }
 
@@ -1272,6 +1358,16 @@ async function safeAnswerCallback(ctx: Context, text: string): Promise<void> {
     await ctx.answerCbQuery(text);
   } catch (error) {
     console.warn("Could not answer callback query", error);
+  }
+}
+
+async function safeDeleteMessage(ctx: Context, messageId: number | undefined): Promise<void> {
+  if (!messageId || !ctx.chat?.id) return;
+
+  try {
+    await ctx.telegram.deleteMessage(ctx.chat.id, messageId);
+  } catch {
+    // Ignore Telegram delete failures for old messages or missing bot permissions.
   }
 }
 

@@ -4,6 +4,7 @@ import {
   Connection,
   Keypair,
   LAMPORTS_PER_SOL,
+  PublicKey,
   Transaction,
   VersionedTransaction
 } from "@solana/web3.js";
@@ -116,6 +117,7 @@ export async function launchWithPumpFunSdk(
     proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL,
     priorityFeeForLaunchpad(proposal.launchpad)
   );
+  validatePumpFunFeeShares();
 
   const mintKeypair = getMintKeypair(proposal);
   const mintSigner = Keypair.fromSecretKey(bs58.decode(mintKeypair.secretKeyBase58));
@@ -126,6 +128,9 @@ export async function launchWithPumpFunSdk(
     console.log(`[launch:${proposal.id}] metadata ready: ${metadataUri}`);
 
     const signature = await sendPumpFunSdkCreateWithRetries(proposal, signerKeypair, mintSigner, mintKeypair, metadataUri);
+    const feeSharingMessage = await configurePumpFunFeeSharingIfEnabled(signerKeypair, mintSigner.publicKey).catch(
+      (error) => `\nFee sharing not locked: ${errorMessage(error)}`
+    );
     if (mintKeypair.poolId) markVanityMintUsed(mintKeypair.poolId);
 
     return {
@@ -135,7 +140,7 @@ export async function launchWithPumpFunSdk(
       signature,
       explorerUrl: `https://solscan.io/tx/${signature}`,
       metadataUri,
-      message: `Launched ${proposal.name} ($${proposal.symbol}).`
+      message: `Launched ${proposal.name} ($${proposal.symbol}).${feeSharingMessage}`
     };
   } catch (error) {
     if (mintKeypair.poolId) {
@@ -350,17 +355,31 @@ async function sendPumpFunSdkCreateRequest(
     amount: solAmount
   });
 
-  const createInstructions = await sdk.createAndBuyInstructions({
-    global,
-    mint: mintSigner.publicKey,
-    name: proposal.name,
-    symbol: proposal.symbol,
-    uri: metadataUri,
-    creator: signerKeypair.publicKey,
-    user: signerKeypair.publicKey,
-    solAmount,
-    amount: tokenAmount
-  });
+  const createInstructions = config.PUMPFUN_CASHBACK
+    ? await sdk.createV2AndBuyInstructions({
+        global,
+        mint: mintSigner.publicKey,
+        name: proposal.name,
+        symbol: proposal.symbol,
+        uri: metadataUri,
+        creator: signerKeypair.publicKey,
+        user: signerKeypair.publicKey,
+        solAmount,
+        amount: tokenAmount,
+        mayhemMode: false,
+        cashback: true
+      })
+    : await sdk.createAndBuyInstructions({
+        global,
+        mint: mintSigner.publicKey,
+        name: proposal.name,
+        symbol: proposal.symbol,
+        uri: metadataUri,
+        creator: signerKeypair.publicKey,
+        user: signerKeypair.publicKey,
+        solAmount,
+        amount: tokenAmount
+      });
 
   const computeUnitLimit = 450_000;
   const priorityMicroLamports = Math.max(
@@ -407,6 +426,86 @@ async function sendPumpFunSdkCreateRequest(
   }
 
   return signature;
+}
+
+async function configurePumpFunFeeSharingIfEnabled(signerKeypair: Keypair, mint: PublicKey): Promise<string> {
+  const shareholders = parsePumpFunFeeShares();
+  if (shareholders.length === 0) return "";
+
+  const connection = new Connection(config.SOLANA_RPC_URL, "confirmed");
+  const sdk = new PumpSdk();
+  const instructions = await sdk.createSharingConfigWithSocialRecipients({
+    creator: signerKeypair.publicKey,
+    mint,
+    pool: null,
+    newShareholders: shareholders.map((shareholder) => ({
+      address: shareholder.address,
+      shareBps: shareholder.shareBps
+    }))
+  });
+
+  const transaction = new Transaction().add(...instructions);
+  transaction.feePayer = signerKeypair.publicKey;
+  const latestBlockhash = await connection.getLatestBlockhash("confirmed");
+  transaction.recentBlockhash = latestBlockhash.blockhash;
+  transaction.sign(signerKeypair);
+
+  const signature = await connection.sendRawTransaction(transaction.serialize(), {
+    maxRetries: 3,
+    skipPreflight: false
+  });
+  const confirmation = await connection.confirmTransaction(
+    {
+      signature,
+      blockhash: latestBlockhash.blockhash,
+      lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
+    },
+    "confirmed"
+  );
+  if (confirmation.value.err) {
+    throw new Error(
+      `Pump.fun fee sharing transaction failed on-chain: ${JSON.stringify(confirmation.value.err)}. ` +
+        `Solscan: https://solscan.io/tx/${signature}`
+    );
+  }
+
+  return `\nFee sharing locked: https://solscan.io/tx/${signature}`;
+}
+
+function validatePumpFunFeeShares(): void {
+  parsePumpFunFeeShares();
+}
+
+function parsePumpFunFeeShares(): Array<{ address: PublicKey; shareBps: number }> {
+  const raw = config.PUMPFUN_FEE_SHARES.trim();
+  if (!raw) return [];
+
+  const shares = raw.split(",").map((part) => {
+    const [addressText, bpsText] = part.split(":").map((value) => value?.trim());
+    if (!addressText || !bpsText) {
+      throw new NonRetryableLaunchError(
+        "PUMPFUN_FEE_SHARES must use address:bps pairs, for example ADDRESS1:8000,ADDRESS2:2000."
+      );
+    }
+
+    const shareBps = Number(bpsText);
+    if (!Number.isInteger(shareBps) || shareBps <= 0) {
+      throw new NonRetryableLaunchError(`Invalid Pump.fun fee share bps for ${addressText}: ${bpsText}.`);
+    }
+
+    try {
+      return { address: new PublicKey(addressText), shareBps };
+    } catch {
+      throw new NonRetryableLaunchError(`Invalid Pump.fun fee share address: ${addressText}.`);
+    }
+  });
+
+  const total = shares.reduce((sum, share) => sum + share.shareBps, 0);
+  if (total !== 10000) {
+    throw new NonRetryableLaunchError(`PUMPFUN_FEE_SHARES must total 10000 bps. Current total: ${total}.`);
+  }
+
+  return shares;
 }
 
 async function sendLocalCreateRequest(

@@ -16,6 +16,11 @@ const envSchema = z.object({
     .default("true")
     .transform((value) => value.toLowerCase() !== "false"),
   PUMPFUN_SIGNER_PRIVATE_KEY: z.string().optional(),
+  PUMPFUN_CASHBACK: z
+    .string()
+    .default("false")
+    .transform((value) => value.toLowerCase() === "true"),
+  PUMPFUN_FEE_SHARES: z.string().default(""),
   PUMPPORTAL_API_KEY: z.string().optional(),
   BAGS_API_KEY: z.string().optional(),
   PINATA_JWT: z.string().optional(),
