@@ -772,6 +772,22 @@ bot.action(/^wizard:(.+)$/, async (ctx) => {
       return;
     }
 
+    if (action === "fees_custom") {
+      await ctx.answerCbQuery("Reply with wallet:bps,wallet:bps.");
+      await ctx.reply(
+        [
+          "<b>Custom Fee Split</b>",
+          "",
+          "Reply to the fee-sharing step with a split totaling 10000 bps.",
+          "",
+          "Example:",
+          "<code>CREATOR_WALLET:8000,TREASURY_WALLET:2000</code>"
+        ].join("\n"),
+        telegramReplyOptions
+      );
+      return;
+    }
+
     if (action === "group_tg") {
       const username = ctx.chat && "username" in ctx.chat ? ctx.chat.username : undefined;
       if (!username) {
@@ -1379,7 +1395,7 @@ function wizardQuestion(step: DraftStep): {
     devBuy: "Choose the dev buy amount, send a custom SOL amount, or use default.",
     cashback: "Pump.fun cashback uses the V2 create flow. Enable it only if you want cashback on this launch.",
     feeShares:
-      "Choose Pump.fun creator-fee sharing. This can lock reward distribution once configured. Send custom as <code>wallet:bps,wallet:bps</code> totaling 10000."
+      "Choose Pump.fun creator-fee sharing. This can lock reward distribution once configured. Tap Custom Split or reply with <code>wallet:bps,wallet:bps</code> totaling 10000."
   };
 
   const skipButton = (field: string): InlineKeyboardButton => ({
@@ -1415,6 +1431,7 @@ function wizardQuestion(step: DraftStep): {
         { text: "No Fee Sharing", callback_data: "wizard:fees:none" },
         { text: "Creator 100%", callback_data: "wizard:fees:creator" }
       ],
+      [{ text: "Custom Split", callback_data: "wizard:fees_custom" }],
       [{ text: "❌ Cancel", callback_data: "wizard:cancel" }]
     ]
   };
