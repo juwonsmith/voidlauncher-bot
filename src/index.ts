@@ -1560,12 +1560,17 @@ function isWizardReply(ctx: Context, draft: Draft): boolean {
 }
 
 function walletMessage(title: string, wallet: WalletView): string {
+  const providerLabel =
+    wallet.provider === "pumpportal"
+      ? "Launch Wallet (Pump.fun SDK + Bonk API)"
+      : "Launch Wallet";
+
   return [
     `<b>${escapeHtml(title)}</b>`,
     "",
     wallet.created ? "Created a new wallet." : undefined,
-    `Provider: <b>${wallet.provider === "pumpportal" ? "PumpPortal" : "Local"}</b>`,
-    wallet.hasApiKey ? "API key: <b>encrypted</b>" : undefined,
+    `Provider: <b>${providerLabel}</b>`,
+    wallet.hasApiKey ? "Bonk API key: <b>encrypted</b>" : undefined,
     `Address: <code>${escapeHtml(wallet.address)}</code>`,
     wallet.balanceSol === undefined
       ? wallet.balanceError
@@ -1573,7 +1578,7 @@ function walletMessage(title: string, wallet: WalletView): string {
         : `Balance: use <code>/groupbalance</code> to refresh`
       : `Balance: <b>${wallet.balanceSol.toFixed(6)} SOL</b>`,
     "",
-    "Deposit SOL to this address. The private key is encrypted and never shown in Telegram."
+    "Deposit SOL to this address. Pump.fun signs with this encrypted wallet; Bonk uses its encrypted API key. The private key is never shown in Telegram."
   ]
     .filter(Boolean)
     .join("\n");
