@@ -57,8 +57,12 @@ export function proposalMessage(proposal: Proposal, heading = "New Coin Idea"): 
     `&#128640; Launchpad: <b>${launchpadName(proposal.launchpad)}</b>`,
     `&#128205; Status: <b>${statusLabel(proposal.status)}</b>`,
     `&#128176; Dev Buy: <b>${proposal.devBuySol ?? "default"} SOL</b>`,
-    proposal.launchpad === "pumpfun" ? `Cashback: <b>${proposal.pumpfunCashback ? "Enabled" : "Off"}</b>` : undefined,
-    proposal.launchpad === "pumpfun" ? `Fee sharing: <b>${feeShareLabel(proposal.pumpfunFeeShares)}</b>` : undefined,
+    proposal.launchpad === "pumpfun"
+      ? `&#127873; Cashback: <b>${proposal.pumpfunCashback ? "Enabled" : "Off"}</b>`
+      : undefined,
+    proposal.launchpad === "pumpfun"
+      ? `&#129309; Fee Share: <b>${feeShareLabel(proposal.pumpfunFeeShares)}</b>`
+      : undefined,
     "",
     
     `&#128221; ${escapeHtml(proposal.description)}`,
@@ -259,8 +263,23 @@ function launchpadName(launchpad: Proposal["launchpad"]): string {
 
 function feeShareLabel(value: string | undefined): string {
   if (!value) return "None";
-  if (value === "creator:10000") return "Creator 100%";
-  return escapeHtml(value);
+  const parts = value.split(",").map((part) => {
+    const [wallet, bpsText] = part.split(":");
+    const bps = Number(bpsText);
+    if (!wallet || !Number.isFinite(bps)) return escapeHtml(part);
+
+    const percent = bps / 100;
+    const percentText = Number.isInteger(percent) ? `${percent}%` : `${percent.toFixed(2)}%`;
+    if (wallet.toLowerCase() === "creator") return `Creator ${percentText}`;
+    return `${shortAddress(wallet)} ${percentText}`;
+  });
+
+  return parts.join(" / ");
+}
+
+function shortAddress(value: string): string {
+  if (value.length <= 12) return escapeHtml(value);
+  return `<code>${escapeHtml(value.slice(0, 4))}...${escapeHtml(value.slice(-4))}</code>`;
 }
 
 function statusLabel(status: Proposal["status"]): string {
