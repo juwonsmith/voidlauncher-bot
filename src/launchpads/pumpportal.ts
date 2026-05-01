@@ -35,6 +35,12 @@ interface MintKeypair {
   poolId?: number;
 }
 
+interface FeeSharingResult {
+  signature?: string;
+  url?: string;
+  error?: string;
+}
+
 class UnknownConfirmationError extends Error {}
 class NonRetryableLaunchError extends Error {}
 class UnlandedLaunchError extends Error {}
@@ -127,8 +133,8 @@ export async function launchWithPumpFunSdk(
     console.log(`[launch:${proposal.id}] metadata ready: ${metadataUri}`);
 
     const signature = await sendPumpFunSdkCreateWithRetries(proposal, signerKeypair, mintSigner, mintKeypair, metadataUri);
-    const feeSharingMessage = await configurePumpFunFeeSharingIfEnabled(proposal, signerKeypair, mintSigner.publicKey).catch(
-      (error) => `\nFee sharing not locked: ${errorMessage(error)}`
+    const feeSharing: FeeSharingResult = await configurePumpFunFeeSharingIfEnabled(proposal, signerKeypair, mintSigner.publicKey).catch(
+      (error) => ({ error: errorMessage(error) })
     );
     if (mintKeypair.poolId) markVanityMintUsed(mintKeypair.poolId);
 
@@ -139,7 +145,10 @@ export async function launchWithPumpFunSdk(
       signature,
       explorerUrl: `https://solscan.io/tx/${signature}`,
       metadataUri,
-      message: `Launched ${proposal.name} ($${proposal.symbol}).${feeSharingMessage}`
+      feeSharingSignature: feeSharing.signature,
+      feeSharingUrl: feeSharing.url,
+      feeSharingError: feeSharing.error,
+      message: `Launched ${proposal.name} ($${proposal.symbol}).`
     };
   } catch (error) {
     if (mintKeypair.poolId) {
@@ -422,9 +431,9 @@ async function configurePumpFunFeeSharingIfEnabled(
   proposal: Proposal,
   signerKeypair: Keypair,
   mint: PublicKey
-): Promise<string> {
+): Promise<FeeSharingResult> {
   const shareholders = parsePumpFunFeeShares(proposal, signerKeypair.publicKey);
-  if (shareholders.length === 0) return "";
+  if (shareholders.length === 0) return {};
 
   const connection = new Connection(config.SOLANA_RPC_URL, "confirmed");
   const sdk = new PumpSdk();
@@ -463,7 +472,7 @@ async function configurePumpFunFeeSharingIfEnabled(
     );
   }
 
-  return `\nFee sharing locked: https://solscan.io/tx/${signature}`;
+  return { signature, url: `https://solscan.io/tx/${signature}` };
 }
 
 function validatePumpFunFeeShares(proposal: Proposal, creatorAddress: PublicKey): void {

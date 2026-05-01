@@ -158,6 +158,8 @@ export function launchMessage(result: LaunchResult): string {
 
   return [
     result.dryRun ? `&#129514; <b>${escapeHtml(result.message)}</b>` : `&#128640; ${escapeHtml(result.message)}`,
+    result.feeSharingUrl ? `&#129309; Fee Share: <a href="${escapeAttr(result.feeSharingUrl)}">Locked</a>` : undefined,
+    result.feeSharingError ? `&#9888; Fee Share: ${escapeHtml(result.feeSharingError)}` : undefined,
     result.mint ? `&#129689; CA: <code>${escapeHtml(result.mint)}</code>` : undefined,
     result.explorerUrl ? `&#128269; Solscan: <a href="${escapeAttr(result.explorerUrl)}">Solscan</a>` : undefined,
     links.length > 0 ? `&#128279; Links: ${links.join(" | ")}` : undefined

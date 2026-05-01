@@ -34,5 +34,8 @@ export interface LaunchResult {
   signature?: string;
   explorerUrl?: string;
   metadataUri?: string;
+  feeSharingSignature?: string;
+  feeSharingUrl?: string;
+  feeSharingError?: string;
   message: string;
 }
