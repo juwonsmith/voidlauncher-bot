@@ -1,6 +1,5 @@
 import { getBuyTokenAmountFromSolAmount, OnlinePumpSdk, PumpSdk } from "@pump-fun/pump-sdk";
 import {
-  ComputeBudgetProgram,
   Connection,
   Keypair,
   LAMPORTS_PER_SOL,
@@ -381,16 +380,7 @@ async function sendPumpFunSdkCreateRequest(
         amount: tokenAmount
       });
 
-  const computeUnitLimit = 450_000;
-  const priorityMicroLamports = Math.max(
-    1,
-    Math.ceil((priorityFeeForLaunchpad(proposal.launchpad) * LAMPORTS_PER_SOL * 1_000_000) / computeUnitLimit)
-  );
-  const transaction = new Transaction().add(
-    ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnitLimit }),
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityMicroLamports }),
-    ...createInstructions
-  );
+  const transaction = new Transaction().add(...createInstructions);
   transaction.feePayer = signerKeypair.publicKey;
   const latestBlockhash = await connection.getLatestBlockhash("confirmed");
   transaction.recentBlockhash = latestBlockhash.blockhash;
