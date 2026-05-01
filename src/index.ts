@@ -725,13 +725,41 @@ bot.action(/^fees_menu:(\d+)$/, async (ctx) => {
     reply_markup: {
       inline_keyboard: [
         [
+          {
+            text: proposal.pumpfunCashback ? "Cashback: On" : "Cashback: Off",
+            callback_data: `cashback_toggle:${proposal.id}`
+          }
+        ],
+        [
           { text: "No Fee Sharing", callback_data: `fees_set:${proposal.id}:none` },
           { text: "Creator 100%", callback_data: `fees_set:${proposal.id}:creator` }
         ],
-        [{ text: "Custom Split", switch_inline_query_current_chat: `/setfees ${proposal.id} ` }]
+        [{ text: "Custom Split", callback_data: `fees_custom_prompt:${proposal.id}` }]
       ]
     }
   });
+});
+
+bot.action(/^fees_custom_prompt:(\d+)$/, async (ctx) => {
+  const proposal = getProposal(Number(ctx.match[1]));
+  if (!proposal) return safeAnswerCallback(ctx, "Proposal not found.");
+  if (!(await canEditProposalSettings(ctx, proposal))) return safeAnswerCallback(ctx, "Creator or admin only.");
+
+  await safeAnswerCallback(ctx, "Send custom split.");
+  await ctx.reply(
+    [
+      `<b>Custom Fee Split #${proposal.id}</b>`,
+      "",
+      "Send the split as wallets and percentages totaling 100%.",
+      "",
+      "Example:",
+      `<code>/setfees ${proposal.id} WALLET1:50,WALLET2:50</code>`,
+      "",
+      "You can also use bps:",
+      `<code>/setfees ${proposal.id} WALLET1:5000,creator:5000</code>`
+    ].join("\n"),
+    telegramReplyOptions
+  );
 });
 
 bot.action(/^fees_set:(\d+):(.+)$/, async (ctx) => {
@@ -1198,13 +1226,23 @@ function normalizeFeeShareSetting(value: string): string | undefined {
   if (lower === "creator" || lower === "creator:10000") return "creator:10000";
 
   const total = normalized.split(",").reduce((sum, part) => {
-    const [, bpsText] = part.split(":");
-    const bps = Number(bpsText);
-    if (!Number.isInteger(bps) || bps <= 0) throw new Error("Custom fees must be wallet:bps pairs.");
+    const [, rawShareText] = part.split(":");
+    const rawShare = Number(rawShareText?.replace("%", ""));
+    if (!Number.isFinite(rawShare) || rawShare <= 0) throw new Error("Custom fees must be wallet:percent pairs.");
+    const bps = rawShare <= 100 ? Math.round(rawShare * 100) : rawShare;
+    if (!Number.isInteger(bps) || bps <= 0) throw new Error("Custom fees must be wallet:percent pairs.");
     return sum + bps;
   }, 0);
   if (total !== 10000) throw new Error(`Fee share bps must total 10000. Current total: ${total}.`);
-  return normalized;
+  return normalized
+    .split(",")
+    .map((part) => {
+      const [wallet, rawShareText] = part.split(":");
+      const rawShare = Number(rawShareText?.replace("%", ""));
+      const bps = rawShare <= 100 ? Math.round(rawShare * 100) : rawShare;
+      return `${wallet.trim()}:${bps}`;
+    })
+    .join(",");
 }
 
 async function canEditProposalSettings(ctx: Context, proposal: Proposal): Promise<boolean> {
@@ -1223,15 +1261,10 @@ function feeSettingsMessage(proposal: Proposal): string {
     "",
     `<b>${escapeHtml(proposal.name)}</b> | <code>$${escapeHtml(proposal.symbol)}</code>`,
     `Launchpad: <b>${proposal.launchpad === "pumpfun" ? "Pump.fun" : proposal.launchpad}</b>`,
-    `Cashback: <b>${proposal.pumpfunCashback ? "Enabled" : "Off"}</b>`,
-    `Fee sharing: <b>${escapeHtml(fees)}</b>`,
+    `&#127873; Cashback: <b>${proposal.pumpfunCashback ? "On" : "Off"}</b>`,
+    `&#129309; Fee Share: <b>${escapeHtml(fees)}</b>`,
     "",
-    "<b>Commands</b>",
-    `<code>/cashback ${proposal.id} on</code> or <code>/cashback ${proposal.id} off</code>`,
-    `<code>/setfees ${proposal.id} none</code>`,
-    `<code>/setfees ${proposal.id} creator</code>`,
-    `<code>/setfees ${proposal.id} WALLET1:8000,WALLET2:2000</code>`,
-    "",
+    "Use the buttons below to change launch fee settings.",
     "Fee sharing can lock Pump.fun reward distribution once configured."
   ].join("\n");
 }

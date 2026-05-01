@@ -107,7 +107,7 @@ export function proposalKeyboard(proposal: Proposal): InlineKeyboardButton[][] {
 
   if (proposal.launchpad === "pumpfun" && proposal.status !== "launched" && proposal.status !== "rejected") {
     rows.push([
-      { text: proposal.pumpfunCashback ? "Cashback Off" : "Cashback On", callback_data: `cashback_toggle:${proposal.id}` },
+      { text: proposal.pumpfunCashback ? "Cashback: On" : "Cashback: Off", callback_data: `cashback_toggle:${proposal.id}` },
       { text: "Fees", callback_data: `fees_menu:${proposal.id}` }
     ]);
   }
