@@ -57,6 +57,7 @@ import {
 
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
 const drafts = new Map<string, Draft>();
+const rejectionDrafts = new Map<string, RejectionDraft>();
 const activeLaunches = new Set<string>();
 
 type DraftStep =
@@ -81,6 +82,11 @@ interface Draft {
   promptMessageId?: number;
   customFeeWallet?: string;
   forcedStep?: DraftStep;
+}
+
+interface RejectionDraft {
+  proposalId: number;
+  promptMessageId?: number;
 }
 
 bot.use(async (ctx, next) => {
@@ -312,6 +318,17 @@ bot.command("cancel", async (ctx) => {
 
 bot.on("text", async (ctx, next) => {
   const key = draftKey(ctx);
+  const rejectionDraft = key ? rejectionDrafts.get(key) : undefined;
+  if (key && rejectionDraft && !ctx.message.text.startsWith("/") && isRejectionReply(ctx, rejectionDraft)) {
+    try {
+      await applyRejectionText(ctx, key, rejectionDraft, ctx.message.text.trim());
+      await safeDeleteWizardInput(ctx, ctx.message.message_id);
+    } catch (error) {
+      await ctx.reply(formatError(error), telegramReplyOptions);
+    }
+    return;
+  }
+
   const draft = key ? drafts.get(key) : undefined;
   if (!key || !draft || ctx.message.text.startsWith("/") || !isWizardReply(ctx, draft)) {
     return next();
@@ -724,6 +741,40 @@ bot.action(/^fees_set:(\d+):(.+)$/, async (ctx) => {
   const updated = updateProposalFeeShares(proposal.id, normalizeFeeShareSetting(ctx.match[2]));
   await safeAnswerCallback(ctx, "Fee settings updated.");
   await ctx.reply(feeSettingsMessage(updated ?? proposal), telegramReplyOptions);
+});
+
+bot.action(/^reject_prompt:(\d+)$/, async (ctx) => {
+  if (!(await isBotAdmin(ctx))) {
+    await safeAnswerCallback(ctx, "Admin command only.");
+    return;
+  }
+
+  const proposalId = Number(ctx.match[1]);
+  const proposal = getProposal(proposalId);
+  if (!proposal) {
+    await safeAnswerCallback(ctx, "Proposal not found.");
+    return;
+  }
+  if (proposal.status !== "pending" && proposal.status !== "approved") {
+    await safeAnswerCallback(ctx, `Proposal is ${proposal.status}.`);
+    return;
+  }
+
+  const key = draftKey(ctx);
+  if (!key) {
+    await safeAnswerCallback(ctx, "Could not identify admin.");
+    return;
+  }
+
+  await safeAnswerCallback(ctx, "Send rejection reason.");
+  const prompt = await ctx.reply(
+    [`<b>Reject #${proposalId}</b>`, "", "Reply with the reason for rejection."].join("\n"),
+    {
+      ...telegramReplyOptions,
+      reply_markup: { force_reply: true, selective: true }
+    }
+  );
+  rejectionDrafts.set(key, { proposalId, promptMessageId: prompt.message_id });
 });
 
 bot.action(/^wizard:(.+)$/, async (ctx) => {
@@ -1557,6 +1608,39 @@ function isWizardReply(ctx: Context, draft: Draft): boolean {
   const message = ctx.update.message as { reply_to_message?: { message_id?: number } };
   const replyTo = message.reply_to_message;
   return Boolean(draft.promptMessageId && replyTo?.message_id === draft.promptMessageId);
+}
+
+function isRejectionReply(ctx: Context, draft: RejectionDraft): boolean {
+  if (ctx.chat?.type === "private") return true;
+  if (!("message" in ctx.update)) return false;
+  const message = ctx.update.message as { reply_to_message?: { message_id?: number } };
+  const replyTo = message.reply_to_message;
+  return Boolean(draft.promptMessageId && replyTo?.message_id === draft.promptMessageId);
+}
+
+async function applyRejectionText(
+  ctx: Context,
+  key: string,
+  draft: RejectionDraft,
+  reason: string
+): Promise<void> {
+  if (reason.length < 2 || reason.length > 300) {
+    throw new Error("Rejection reason must be 2-300 characters.");
+  }
+
+  const proposal = rejectProposal(draft.proposalId, reason);
+  rejectionDrafts.delete(key);
+  await safeDeleteMessage(ctx, draft.promptMessageId, "rejection prompt");
+
+  if (!proposal) {
+    await ctx.reply(`Proposal #${draft.proposalId} not found or cannot be rejected.`);
+    return;
+  }
+
+  await ctx.reply(
+    [`<b>Rejected #${proposal.id}</b>`, "", escapeHtml(reason)].join("\n"),
+    telegramReplyOptions
+  );
 }
 
 function walletMessage(title: string, wallet: WalletView): string {

@@ -113,7 +113,7 @@ export function proposalKeyboard(proposal: Proposal): InlineKeyboardButton[][] {
   }
 
   if (proposal.status === "pending" || proposal.status === "approved") {
-    rows.push([{ text: "Reject with reason", switch_inline_query_current_chat: `/reject ${proposal.id} ` }]);
+    rows.push([{ text: "Reject", callback_data: `reject_prompt:${proposal.id}` }]);
   }
 
   return rows;
