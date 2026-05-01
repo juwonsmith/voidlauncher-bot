@@ -71,12 +71,16 @@ type DraftStep =
   | "devBuy"
   | "cashback"
   | "feeShares"
+  | "feeShareWallet"
+  | "feeSharePercent"
   | "preview";
 
 interface Draft {
   step: DraftStep;
   data: Partial<CoinIdeaInput>;
   promptMessageId?: number;
+  customFeeWallet?: string;
+  forcedStep?: DraftStep;
 }
 
 bot.use(async (ctx, next) => {
@@ -773,18 +777,23 @@ bot.action(/^wizard:(.+)$/, async (ctx) => {
     }
 
     if (action === "fees_custom") {
-      await ctx.answerCbQuery("Reply with wallet:bps,wallet:bps.");
-      await ctx.reply(
-        [
-          "<b>Custom Fee Split</b>",
-          "",
-          "Reply to the fee-sharing step with a split totaling 10000 bps.",
-          "",
-          "Example:",
-          "<code>CREATOR_WALLET:8000,TREASURY_WALLET:2000</code>"
-        ].join("\n"),
-        telegramReplyOptions
-      );
+      draft.forcedStep = "feeShareWallet";
+      await ctx.answerCbQuery("Custom split.");
+      await advanceWizard(ctx, draft, true);
+      return;
+    }
+
+    if (action.startsWith("fees_percent:")) {
+      const percent = Number(action.split(":")[1]);
+      draft.data.pumpfunFeeShares = feeSplitFromPercent(draft.customFeeWallet, percent);
+      await ctx.answerCbQuery(`Recipient gets ${percent}%.`);
+      await advanceWizard(ctx, draft, true);
+      return;
+    }
+
+    if (action === "fees_percent_custom") {
+      await ctx.answerCbQuery("Reply with percent.");
+      await ctx.reply("Reply with a custom percent from 1 to 99. Example: <code>35</code>", telegramReplyOptions);
       return;
     }
 
@@ -1112,6 +1121,25 @@ function parseOnOff(value: string): boolean {
   throw new Error("Use on or off.");
 }
 
+function assertSolanaAddress(value: string, label: string): void {
+  const normalized = value.trim();
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(normalized)) {
+    throw new Error(`Send a valid ${label}.`);
+  }
+}
+
+function feeSplitFromPercent(wallet: string | undefined, percent: number): string {
+  if (!wallet) throw new Error("Send the fee recipient wallet first.");
+  if (!Number.isFinite(percent) || percent <= 0 || percent >= 100) {
+    throw new Error("Fee percent must be greater than 0 and less than 100.");
+  }
+  const recipientBps = Math.round(percent * 100);
+  const creatorBps = 10000 - recipientBps;
+  const split = normalizeFeeShareSetting(`${wallet}:${recipientBps},creator:${creatorBps}`);
+  if (!split) throw new Error("Custom fee split could not be created.");
+  return split;
+}
+
 function normalizeFeeShareSetting(value: string): string | undefined {
   const normalized = value.trim();
   const lower = normalized.toLowerCase();
@@ -1316,6 +1344,12 @@ async function applyWizardText(ctx: Context, draft: Draft, value: string): Promi
     draft.data.devBuySol = amount;
   } else if (draft.step === "feeShares") {
     draft.data.pumpfunFeeShares = normalizeFeeShareSetting(value);
+  } else if (draft.step === "feeShareWallet") {
+    assertSolanaAddress(value, "fee recipient wallet");
+    draft.customFeeWallet = value.trim();
+  } else if (draft.step === "feeSharePercent") {
+    const percent = Number(value.replace("%", ""));
+    draft.data.pumpfunFeeShares = feeSplitFromPercent(draft.customFeeWallet, percent);
   }
 
   await advanceWizard(ctx, draft);
@@ -1346,6 +1380,12 @@ async function advanceWizard(ctx: Context, draft: Draft, edit = false): Promise<
 }
 
 function nextDraftStep(draft: Draft): DraftStep {
+  if (draft.forcedStep) {
+    const step = draft.forcedStep;
+    draft.forcedStep = undefined;
+    return step;
+  }
+
   if (!draft.data.launchpad) return "launchpad";
   if (!draft.data.name) return "name";
   if (!draft.data.symbol) return "symbol";
@@ -1358,6 +1398,8 @@ function nextDraftStep(draft: Draft): DraftStep {
   if (draft.step === "devBuy") return draft.data.launchpad === "pumpfun" ? "cashback" : "preview";
   if (draft.step === "cashback") return "feeShares";
   if (draft.step === "feeShares") return "preview";
+  if (draft.step === "feeShareWallet") return "feeSharePercent";
+  if (draft.step === "feeSharePercent") return "preview";
   return draft.step;
 }
 
@@ -1395,7 +1437,9 @@ function wizardQuestion(step: DraftStep): {
     devBuy: "Choose the dev buy amount, send a custom SOL amount, or use default.",
     cashback: "Pump.fun cashback uses the V2 create flow. Enable it only if you want cashback on this launch.",
     feeShares:
-      "Choose Pump.fun creator-fee sharing. This can lock reward distribution once configured. Tap Custom Split or reply with <code>wallet:bps,wallet:bps</code> totaling 10000."
+      "Choose Pump.fun creator-fee sharing. This can lock reward distribution once configured.",
+    feeShareWallet: "Send the wallet that should receive part of the creator fees.",
+    feeSharePercent: "Choose what percent this wallet should receive. The remaining percent goes to the creator/dev wallet."
   };
 
   const skipButton = (field: string): InlineKeyboardButton => ({
@@ -1433,13 +1477,32 @@ function wizardQuestion(step: DraftStep): {
       ],
       [{ text: "Custom Split", callback_data: "wizard:fees_custom" }],
       [{ text: "❌ Cancel", callback_data: "wizard:cancel" }]
+    ],
+    feeSharePercent: [
+      [
+        { text: "10%", callback_data: "wizard:fees_percent:10" },
+        { text: "20%", callback_data: "wizard:fees_percent:20" },
+        { text: "30%", callback_data: "wizard:fees_percent:30" }
+      ],
+      [
+        { text: "40%", callback_data: "wizard:fees_percent:40" },
+        { text: "50%", callback_data: "wizard:fees_percent:50" },
+        { text: "Custom", callback_data: "wizard:fees_percent_custom" }
+      ],
+      [{ text: "❌ Cancel", callback_data: "wizard:cancel" }]
     ]
   };
 
   return {
     text: wizardQuestionMessage(`Step: ${step}`, questions[step]),
     keyboard: keyboards[step],
-    forceReply: step === "name" || step === "symbol" || step === "description" || step === "feeShares"
+    forceReply:
+      step === "name" ||
+      step === "symbol" ||
+      step === "description" ||
+      step === "feeShares" ||
+      step === "feeShareWallet" ||
+      step === "feeSharePercent"
   };
 }
 
