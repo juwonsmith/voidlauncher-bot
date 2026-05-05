@@ -71,6 +71,51 @@ Wallet-funded launches:
 
 `/launchgroup` is admin-only and spends from the encrypted group wallet. `/launchme` spends from the caller's personal wallet and can be used by the proposal creator or configured admin.
 
+Per-launch platform fee:
+
+```env
+PLATFORM_TREASURY_WALLET=your_treasury_wallet
+PLATFORM_FEE_SOL=0.02
+```
+
+When enabled, the bot adds the platform fee to preflight balance checks and sends it to the treasury wallet only after a successful live launch. The fee is a separate transfer, so it does not make the Pump.fun create transaction larger. For Bonk, use group-wallet launch so the bot has a wallet available to pay the platform fee.
+
+Production controls:
+
+```env
+MAX_DEV_BUY_SOL=0.05
+GROUP_DAILY_LAUNCH_LIMIT=10
+USER_DAILY_LAUNCH_LIMIT=3
+RATE_LIMIT_WINDOW_MS=10000
+RATE_LIMIT_MAX_UPDATES=12
+LOG_DIR=./logs
+HEALTHCHECK_PORT=3001
+```
+
+Every live launch now requires a final spend confirmation button. The bot writes admin actions and launch attempts to SQLite, and writes searchable JSONL logs to `logs/app.jsonl` and `logs/error.jsonl`. Use `/status` for recent launch attempts and uptime.
+
+Launches confirmed through the bot are stored in a persistent `launch_jobs` queue. If the bot restarts before a queued job runs, it resumes from the database on startup. See `docs/production.md` for the AWS runbook and Postgres scale path.
+
+AWS process example with PM2:
+
+```bash
+npm install
+npm run build
+npm install -g pm2
+pm2 start dist/index.js --name voidlauncher
+pm2 save
+pm2 startup
+pm2 logs voidlauncher
+```
+
+Server hygiene:
+
+- Rotate any Telegram token, API key, or private key that was ever pasted into chat.
+- Keep `.env`, `data/`, `logs/`, and wallet backups out of GitHub.
+- Back up `WALLET_ENCRYPTION_KEY` and `data/bot.sqlite`; losing either can make encrypted wallets unrecoverable.
+- Use AWS security groups to allow SSH only from your IP. The bot uses Telegram polling, so it does not need public HTTP/HTTPS unless you expose `HEALTHCHECK_PORT`.
+- Add log rotation on AWS, for example `pm2 install pm2-logrotate`.
+
 Guided flow:
 
 ```text

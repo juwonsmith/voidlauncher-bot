@@ -21,6 +21,8 @@ const envSchema = z.object({
     .default("false")
     .transform((value) => value.toLowerCase() === "true"),
   PUMPFUN_FEE_SHARES: z.string().default(""),
+  PLATFORM_TREASURY_WALLET: z.string().default(""),
+  PLATFORM_FEE_SOL: z.coerce.number().min(0).default(0),
   PUMPPORTAL_API_KEY: z.string().optional(),
   BAGS_API_KEY: z.string().optional(),
   PINATA_JWT: z.string().optional(),
@@ -28,6 +30,11 @@ const envSchema = z.object({
   BALANCE_CHECK_TIMEOUT_MS: z.coerce.number().int().positive().default(12000),
   BALANCE_CHECK_ATTEMPTS: z.coerce.number().int().positive().default(3),
   DEFAULT_DEV_BUY_SOL: z.coerce.number().positive().default(0.01),
+  MAX_DEV_BUY_SOL: z.coerce.number().positive().default(0.05),
+  GROUP_DAILY_LAUNCH_LIMIT: z.coerce.number().int().positive().default(10),
+  USER_DAILY_LAUNCH_LIMIT: z.coerce.number().int().positive().default(3),
+  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(10_000),
+  RATE_LIMIT_MAX_UPDATES: z.coerce.number().int().positive().default(12),
   DEFAULT_SLIPPAGE_PERCENT: z.coerce.number().positive().max(50).default(10),
   DEFAULT_PRIORITY_FEE_SOL: z.coerce.number().positive().default(0.00005),
   BONK_QUOTE_MINT: z.string().default(""),
@@ -46,6 +53,8 @@ const envSchema = z.object({
   LAUNCH_RETRY_DELAY_MS: z.coerce.number().int().positive().default(3000),
   LAUNCH_CONFIRM_ATTEMPTS: z.coerce.number().int().positive().default(20),
   LAUNCH_CONFIRM_DELAY_MS: z.coerce.number().int().positive().default(3000),
+  LAUNCH_JOB_POLL_MS: z.coerce.number().int().positive().default(2000),
+  LAUNCH_JOB_MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),
   REQUIRE_LAUNCH_CONFIRMATION: z
     .string()
     .default("false")
@@ -57,6 +66,8 @@ const envSchema = z.object({
     .string()
     .default("true")
     .transform((value) => value.toLowerCase() !== "false"),
+  HEALTHCHECK_PORT: z.coerce.number().int().positive().default(0),
+  LOG_DIR: z.string().default("./logs"),
   WALLET_ENCRYPTION_KEY: z.string().optional()
 });
 

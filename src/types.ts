@@ -37,5 +37,8 @@ export interface LaunchResult {
   feeSharingSignature?: string;
   feeSharingUrl?: string;
   feeSharingError?: string;
+  platformFeeSignature?: string;
+  platformFeeUrl?: string;
+  platformFeeError?: string;
   message: string;
 }

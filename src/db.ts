@@ -66,6 +66,64 @@ db.exec(`
   );
 `);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action TEXT NOT NULL,
+    actor_id INTEGER,
+    actor_username TEXT,
+    chat_id TEXT,
+    proposal_id INTEGER,
+    details TEXT,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
+  CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
+
+  CREATE TABLE IF NOT EXISTS launch_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id INTEGER NOT NULL,
+    launchpad TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    payer_address TEXT,
+    chat_id TEXT,
+    actor_id INTEGER,
+    status TEXT NOT NULL,
+    signature TEXT,
+    mint TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_launch_attempts_proposal ON launch_attempts(proposal_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_launch_attempts_chat ON launch_attempts(chat_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_launch_attempts_actor ON launch_attempts(actor_id, created_at);
+
+  CREATE TABLE IF NOT EXISTS launch_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id INTEGER NOT NULL,
+    launchpad TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    actor_id INTEGER,
+    actor_username TEXT,
+    status TEXT NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    signature TEXT,
+    mint TEXT,
+    created_at TEXT NOT NULL,
+    run_after TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_launch_jobs_status_run_after ON launch_jobs(status, run_after, id);
+  CREATE INDEX IF NOT EXISTS idx_launch_jobs_proposal ON launch_jobs(proposal_id, created_at);
+`);
+
 try {
   db.prepare("ALTER TABLE wallets ADD COLUMN encrypted_api_key TEXT").run();
 } catch {
@@ -106,6 +164,59 @@ export interface StoredWallet {
   encryptedApiKey?: string;
   provider: "local" | "pumpportal";
   createdAt: string;
+}
+
+export interface AuditLogInput {
+  action: string;
+  actorId?: number;
+  actorUsername?: string;
+  chatId?: string;
+  proposalId?: number;
+  details?: unknown;
+}
+
+export interface LaunchAttemptInput {
+  proposalId: number;
+  launchpad: string;
+  mode: "api" | "group" | "personal";
+  payerAddress?: string;
+  chatId?: string;
+  actorId?: number;
+}
+
+export interface LaunchAttemptUpdate {
+  status: "success" | "failed";
+  signature?: string;
+  mint?: string;
+  error?: string;
+}
+
+export interface LaunchJob {
+  id: number;
+  proposalId: number;
+  launchpad: string;
+  mode: "api" | "group" | "personal";
+  chatId: string;
+  actorId?: number;
+  actorUsername?: string;
+  status: "queued" | "running" | "success" | "failed";
+  attempts: number;
+  lastError?: string;
+  signature?: string;
+  mint?: string;
+  createdAt: string;
+  runAfter: string;
+  startedAt?: string;
+  completedAt?: string;
+}
+
+export interface LaunchJobInput {
+  proposalId: number;
+  launchpad: string;
+  mode: LaunchJob["mode"];
+  chatId: string;
+  actorId?: number;
+  actorUsername?: string;
 }
 
 function mapWallet(row: Record<string, unknown>): StoredWallet {
@@ -265,6 +376,207 @@ export function markLaunched(id: number, signature?: string): Proposal | undefin
     id
   );
   return getProposal(id);
+}
+
+export function createAuditLog(input: AuditLogInput): void {
+  db.prepare(
+    `INSERT INTO audit_logs (action, actor_id, actor_username, chat_id, proposal_id, details, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    input.action,
+    input.actorId ?? null,
+    input.actorUsername ?? null,
+    input.chatId ?? null,
+    input.proposalId ?? null,
+    input.details === undefined ? null : JSON.stringify(input.details),
+    new Date().toISOString()
+  );
+}
+
+export function createLaunchAttempt(input: LaunchAttemptInput): number {
+  const result = db
+    .prepare(
+      `INSERT INTO launch_attempts (
+        proposal_id, launchpad, mode, payer_address, chat_id, actor_id, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?)`
+    )
+    .run(
+      input.proposalId,
+      input.launchpad,
+      input.mode,
+      input.payerAddress ?? null,
+      input.chatId ?? null,
+      input.actorId ?? null,
+      new Date().toISOString()
+    );
+  return Number(result.lastInsertRowid);
+}
+
+export function finishLaunchAttempt(id: number, update: LaunchAttemptUpdate): void {
+  db.prepare(
+    `UPDATE launch_attempts
+     SET status = ?, signature = ?, mint = ?, error = ?, completed_at = ?
+     WHERE id = ?`
+  ).run(update.status, update.signature ?? null, update.mint ?? null, update.error ?? null, new Date().toISOString(), id);
+}
+
+export function countSuccessfulLaunchesSince(scope: "chat" | "actor", id: string | number, sinceIso: string): number {
+  const column = scope === "chat" ? "chat_id" : "actor_id";
+  const row = db
+    .prepare(`SELECT COUNT(*) AS count FROM launch_attempts WHERE ${column} = ? AND status = 'success' AND created_at >= ?`)
+    .get(String(id), sinceIso) as { count: number };
+  return Number(row.count);
+}
+
+export function recentLaunchAttempts(limit = 8): Array<{
+  proposalId: number;
+  launchpad: string;
+  mode: string;
+  status: string;
+  signature?: string;
+  mint?: string;
+  error?: string;
+  createdAt: string;
+}> {
+  const rows = db
+    .prepare(
+      `SELECT proposal_id, launchpad, mode, status, signature, mint, error, created_at
+       FROM launch_attempts
+       ORDER BY id DESC
+       LIMIT ?`
+    )
+    .all(limit) as Record<string, unknown>[];
+  return rows.map((row) => ({
+    proposalId: Number(row.proposal_id),
+    launchpad: String(row.launchpad),
+    mode: String(row.mode),
+    status: String(row.status),
+    signature: row.signature ? String(row.signature) : undefined,
+    mint: row.mint ? String(row.mint) : undefined,
+    error: row.error ? String(row.error) : undefined,
+    createdAt: String(row.created_at)
+  }));
+}
+
+function mapLaunchJob(row: Record<string, unknown>): LaunchJob {
+  return {
+    id: Number(row.id),
+    proposalId: Number(row.proposal_id),
+    launchpad: String(row.launchpad),
+    mode: String(row.mode) as LaunchJob["mode"],
+    chatId: String(row.chat_id),
+    actorId: row.actor_id === null || row.actor_id === undefined ? undefined : Number(row.actor_id),
+    actorUsername: row.actor_username ? String(row.actor_username) : undefined,
+    status: String(row.status) as LaunchJob["status"],
+    attempts: Number(row.attempts),
+    lastError: row.last_error ? String(row.last_error) : undefined,
+    signature: row.signature ? String(row.signature) : undefined,
+    mint: row.mint ? String(row.mint) : undefined,
+    createdAt: String(row.created_at),
+    runAfter: String(row.run_after),
+    startedAt: row.started_at ? String(row.started_at) : undefined,
+    completedAt: row.completed_at ? String(row.completed_at) : undefined
+  };
+}
+
+export function enqueueLaunchJob(input: LaunchJobInput): LaunchJob {
+  const existing = db
+    .prepare(
+      `SELECT * FROM launch_jobs
+       WHERE proposal_id = ? AND mode = ? AND status IN ('queued', 'running')
+       ORDER BY id DESC
+       LIMIT 1`
+    )
+    .get(input.proposalId, input.mode) as Record<string, unknown> | undefined;
+  if (existing) return mapLaunchJob(existing);
+
+  const now = new Date().toISOString();
+  const result = db
+    .prepare(
+      `INSERT INTO launch_jobs (
+        proposal_id, launchpad, mode, chat_id, actor_id, actor_username, created_at, run_after
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      input.proposalId,
+      input.launchpad,
+      input.mode,
+      input.chatId,
+      input.actorId ?? null,
+      input.actorUsername ?? null,
+      now,
+      now
+    );
+  const job = getLaunchJob(Number(result.lastInsertRowid));
+  if (!job) throw new Error("Failed to read launch job after insert.");
+  return job;
+}
+
+export function getLaunchJob(id: number): LaunchJob | undefined {
+  const row = db.prepare("SELECT * FROM launch_jobs WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+  return row ? mapLaunchJob(row) : undefined;
+}
+
+export function claimNextLaunchJob(maxAttempts: number): LaunchJob | undefined {
+  return db.transaction(() => {
+    const now = new Date().toISOString();
+    db.prepare(
+      `UPDATE launch_jobs
+       SET status = 'queued', started_at = NULL
+       WHERE status = 'running' AND started_at < ?`
+    ).run(new Date(Date.now() - 15 * 60 * 1000).toISOString());
+
+    const row = db
+      .prepare(
+        `SELECT * FROM launch_jobs
+         WHERE status = 'queued' AND run_after <= ? AND attempts < ?
+         ORDER BY id ASC
+         LIMIT 1`
+      )
+      .get(now, maxAttempts) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+
+    db.prepare(
+      `UPDATE launch_jobs
+       SET status = 'running', attempts = attempts + 1, started_at = ?
+       WHERE id = ? AND status = 'queued'`
+    ).run(now, row.id);
+
+    return getLaunchJob(Number(row.id));
+  })();
+}
+
+export function completeLaunchJob(id: number, signature?: string, mint?: string): void {
+  db.prepare(
+    `UPDATE launch_jobs
+     SET status = 'success', signature = ?, mint = ?, completed_at = ?
+     WHERE id = ?`
+  ).run(signature ?? null, mint ?? null, new Date().toISOString(), id);
+}
+
+export function failLaunchJob(id: number, error: string, retryDelayMs: number, maxAttempts: number): void {
+  const job = getLaunchJob(id);
+  if (!job) return;
+  const willRetry = job.attempts < maxAttempts;
+  db.prepare(
+    `UPDATE launch_jobs
+     SET status = ?, last_error = ?, run_after = ?, completed_at = CASE WHEN ? THEN NULL ELSE ? END
+     WHERE id = ?`
+  ).run(
+    willRetry ? "queued" : "failed",
+    error,
+    new Date(Date.now() + retryDelayMs).toISOString(),
+    willRetry ? 1 : 0,
+    new Date().toISOString(),
+    id
+  );
+}
+
+export function recentLaunchJobs(limit = 8): LaunchJob[] {
+  const rows = db
+    .prepare("SELECT * FROM launch_jobs ORDER BY id DESC LIMIT ?")
+    .all(limit) as Record<string, unknown>[];
+  return rows.map(mapLaunchJob);
 }
 
 export function consumeVanityMint(suffix: string, proposalId: number): VanityMint | undefined {

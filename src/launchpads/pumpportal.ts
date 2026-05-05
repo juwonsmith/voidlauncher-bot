@@ -4,6 +4,7 @@ import {
   Keypair,
   LAMPORTS_PER_SOL,
   PublicKey,
+  SystemProgram,
   Transaction,
   VersionedTransaction
 } from "@solana/web3.js";
@@ -36,6 +37,12 @@ interface MintKeypair {
 }
 
 interface FeeSharingResult {
+  signature?: string;
+  url?: string;
+  error?: string;
+}
+
+export interface PlatformFeeResult {
   signature?: string;
   url?: string;
   error?: string;
@@ -136,6 +143,10 @@ export async function launchWithPumpFunSdk(
     const feeSharing: FeeSharingResult = await configurePumpFunFeeSharingIfEnabled(proposal, signerKeypair, mintSigner.publicKey).catch(
       (error) => ({ error: errorMessage(error) })
     );
+    const platformFee: PlatformFeeResult = await sendPlatformFeeIfEnabled(
+      signerSecretKeyBase58,
+      signerKeypair.publicKey.toBase58()
+    ).catch((error): PlatformFeeResult => ({ error: errorMessage(error) }));
     if (mintKeypair.poolId) markVanityMintUsed(mintKeypair.poolId);
 
     return {
@@ -148,6 +159,9 @@ export async function launchWithPumpFunSdk(
       feeSharingSignature: feeSharing.signature,
       feeSharingUrl: feeSharing.url,
       feeSharingError: feeSharing.error,
+      platformFeeSignature: platformFee.signature,
+      platformFeeUrl: platformFee.url,
+      platformFeeError: platformFee.error,
       message: `Launched ${proposal.name} ($${proposal.symbol}).`
     };
   } catch (error) {
@@ -238,6 +252,10 @@ export async function launchWithPumpPortalLocal(
       proposal.launchpad === "bonk" ? await uploadBonkMetadata(proposal) : await uploadPumpMetadataToPinata(proposal);
 
     const signature = await sendLocalCreateWithRetries(proposal, signerKeypair, mintSigner, mintKeypair, metadataUri);
+    const platformFee: PlatformFeeResult = await sendPlatformFeeIfEnabled(
+      signerSecretKeyBase58,
+      signerKeypair.publicKey.toBase58()
+    ).catch((error): PlatformFeeResult => ({ error: errorMessage(error) }));
     if (mintKeypair.poolId) markVanityMintUsed(mintKeypair.poolId);
 
     return {
@@ -247,6 +265,9 @@ export async function launchWithPumpPortalLocal(
       signature,
       explorerUrl: `https://solscan.io/tx/${signature}`,
       metadataUri,
+      platformFeeSignature: platformFee.signature,
+      platformFeeUrl: platformFee.url,
+      platformFeeError: platformFee.error,
       message: `Launched ${proposal.name} ($${proposal.symbol}).`
     };
   } catch (error) {
@@ -259,14 +280,86 @@ export async function launchWithPumpPortalLocal(
 }
 
 async function assertLocalWalletFunded(address: string, devBuySol: number, priorityFeeSol: number): Promise<void> {
+  validatePlatformFeeConfig();
   const balance = await getSolBalance(address);
-  const required = devBuySol + priorityFeeSol + config.LOCAL_LAUNCH_MIN_SOL_BUFFER;
+  const platformFeeSol = configuredPlatformFeeSol();
+  const required = devBuySol + priorityFeeSol + platformFeeSol + config.LOCAL_LAUNCH_MIN_SOL_BUFFER;
   if (balance < required) {
     throw new NonRetryableLaunchError(
       `Local launch wallet needs more SOL. Balance: ${balance.toFixed(6)} SOL. ` +
-        `Required minimum: ${required.toFixed(6)} SOL (${devBuySol} dev buy + fees/rent buffer). ` +
+        `Required minimum: ${required.toFixed(6)} SOL (${devBuySol} dev buy + ${platformFeeSol} platform fee + fees/rent buffer). ` +
         `Fund this wallet, or lower DevBuySol. Address: ${address}`
     );
+  }
+}
+
+export async function sendPlatformFeeIfEnabled(
+  signerSecretKeyBase58: string,
+  signerAddress?: string
+): Promise<PlatformFeeResult> {
+  const platformFeeSol = configuredPlatformFeeSol();
+  if (platformFeeSol <= 0) return {};
+
+  const treasury = platformTreasuryPublicKey();
+  const signerKeypair = Keypair.fromSecretKey(bs58.decode(signerSecretKeyBase58));
+  if (signerAddress && signerKeypair.publicKey.toBase58() !== signerAddress) {
+    throw new Error("Platform fee signer secret does not match wallet address.");
+  }
+
+  const connection = new Connection(config.SOLANA_RPC_URL, "confirmed");
+  const lamports = Math.round(platformFeeSol * LAMPORTS_PER_SOL);
+  const transaction = new Transaction().add(
+    SystemProgram.transfer({
+      fromPubkey: signerKeypair.publicKey,
+      toPubkey: treasury,
+      lamports
+    })
+  );
+  transaction.feePayer = signerKeypair.publicKey;
+  const latestBlockhash = await connection.getLatestBlockhash("confirmed");
+  transaction.recentBlockhash = latestBlockhash.blockhash;
+  transaction.sign(signerKeypair);
+
+  const signature = await connection.sendRawTransaction(transaction.serialize(), {
+    maxRetries: 3,
+    skipPreflight: false
+  });
+  const confirmation = await connection.confirmTransaction(
+    {
+      signature,
+      blockhash: latestBlockhash.blockhash,
+      lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
+    },
+    "confirmed"
+  );
+  if (confirmation.value.err) {
+    throw new Error(
+      `Platform fee transaction failed on-chain: ${JSON.stringify(confirmation.value.err)}. ` +
+        `Solscan: https://solscan.io/tx/${signature}`
+    );
+  }
+
+  return { signature, url: `https://solscan.io/tx/${signature}` };
+}
+
+function configuredPlatformFeeSol(): number {
+  return config.PLATFORM_FEE_SOL > 0 ? config.PLATFORM_FEE_SOL : 0;
+}
+
+function validatePlatformFeeConfig(): void {
+  if (configuredPlatformFeeSol() <= 0) return;
+  platformTreasuryPublicKey();
+}
+
+function platformTreasuryPublicKey(): PublicKey {
+  if (!config.PLATFORM_TREASURY_WALLET) {
+    throw new NonRetryableLaunchError("PLATFORM_TREASURY_WALLET is required when PLATFORM_FEE_SOL is greater than 0.");
+  }
+
+  try {
+    return new PublicKey(config.PLATFORM_TREASURY_WALLET);
+  } catch {
+    throw new NonRetryableLaunchError("PLATFORM_TREASURY_WALLET must be a valid Solana wallet address.");
   }
 }
 

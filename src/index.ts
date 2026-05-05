@@ -1,13 +1,25 @@
 import { Context, Telegraf } from "telegraf";
 import type { InlineKeyboardButton } from "telegraf/types";
+import { PublicKey } from "@solana/web3.js";
+import http from "node:http";
 import { ZodError } from "zod";
 import { config, requireAdmin } from "./config.js";
 import {
   approveProposal,
+  createAuditLog,
+  createLaunchAttempt,
   countAvailableVanityMints,
+  countSuccessfulLaunchesSince,
+  claimNextLaunchJob,
+  completeLaunchJob,
   createProposal,
+  enqueueLaunchJob,
+  failLaunchJob,
+  finishLaunchAttempt,
   getProposal,
   listPendingProposals,
+  recentLaunchAttempts,
+  recentLaunchJobs,
   markLaunched,
   quarantineInexactVanityMints,
   rejectProposal,
@@ -19,6 +31,8 @@ import { launchProposal } from "./launchpads/index.js";
 import {
   launchWithPumpFunSdk,
   launchWithPumpPortalApiKey,
+  sendPlatformFeeIfEnabled,
+  type PlatformFeeResult,
   inspectLaunchOnchain,
   probePumpPortalLocalCreate,
   testLaunchImageFetch
@@ -54,11 +68,15 @@ import {
   getWalletView,
   type WalletView
 } from "./wallets.js";
+import { logError, logInfo } from "./logger.js";
 
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
 const drafts = new Map<string, Draft>();
 const rejectionDrafts = new Map<string, RejectionDraft>();
 const activeLaunches = new Set<string>();
+const rateBuckets = new Map<string, { count: number; resetAt: number }>();
+const startedAt = new Date();
+let launchJobWorkerBusy = false;
 
 type DraftStep =
   | "launchpad"
@@ -89,11 +107,14 @@ interface RejectionDraft {
   promptMessageId?: number;
 }
 
+type LaunchMode = "api" | "group" | "personal";
+
 bot.use(async (ctx, next) => {
   const chatId = ctx.chat?.id ?? "unknown-chat";
   const fromId = ctx.from?.id ?? "unknown-user";
   const text = "message" in ctx.update && "text" in ctx.update.message ? ctx.update.message.text : ctx.updateType;
-  console.log(`[update] chat=${chatId} from=${fromId} type=${ctx.updateType} text=${text}`);
+  if (isRateLimited(String(chatId), String(fromId))) return;
+  logInfo("telegram_update", { chatId, fromId, updateType: ctx.updateType, text });
   return next();
 });
 
@@ -212,6 +233,7 @@ bot.command("exportmywallet", async (ctx) => {
 
   try {
     const exported = exportWalletSecretBase58("user", String(ctx.from.id));
+    audit(ctx, "wallet_export_user", undefined, { address: exported.address });
     return ctx.reply(exportMessage("Personal Wallet Export", exported.address, exported.secretKey), telegramReplyOptions);
   } catch (error) {
     return ctx.reply(formatError(error), telegramReplyOptions);
@@ -245,6 +267,7 @@ bot.command("exportgroupwallet", async (ctx) => {
 
   try {
     const exported = exportPumpPortalWallet("group", groupId);
+    audit(ctx, "wallet_export_group", undefined, { groupId, address: exported.address });
     return ctx.reply(
       exportMessage(`Group PumpPortal Wallet Export ${groupId}`, exported.address, exported.secretKey, exported.apiKey),
       telegramReplyOptions
@@ -272,6 +295,7 @@ bot.action(/^export_group_wallet:(\d+)$/, async (ctx) => {
   }
 
   const exported = exportPumpPortalWallet("group", wallet.scopeId);
+  audit(ctx, "wallet_export_group", undefined, { groupId: wallet.scopeId, address: exported.address });
   await safeAnswerCallback(ctx, "Exported.");
   await ctx.reply(
     exportMessage(`Group PumpPortal Wallet Export ${wallet.scopeId}`, exported.address, exported.secretKey, exported.apiKey),
@@ -508,9 +532,11 @@ bot.command("approve", async (ctx) => {
     return ctx.reply(`Proposal #${id} has no image. Reject it or ask for a new proposal with an image.`);
   }
 
+  await assertApprovalImageValid(pendingProposal);
   const proposal = approveProposal(id, ctx.from.id);
   if (!proposal) return ctx.reply(`Proposal #${id} not found.`);
   if (proposal.status !== "approved") return ctx.reply(`Proposal #${id} is ${proposal.status}.`);
+  audit(ctx, "proposal_approved", id, { launchpad: proposal.launchpad, devBuySol: proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL });
 
   return ctx.reply(`✅ <b>Approved proposal #${id}</b>\nUse <code>/launch ${id}</code> when ready.`, telegramReplyOptions);
 });
@@ -527,6 +553,7 @@ bot.command("reject", async (ctx) => {
 
   const proposal = rejectProposal(id, reason);
   if (!proposal) return ctx.reply(`Proposal #${id} not found.`);
+  audit(ctx, "proposal_rejected", id, { reason });
 
   return ctx.reply(`❌ <b>Rejected proposal #${id}</b>\n${escapeHtml(reason)}`, telegramReplyOptions);
 });
@@ -537,7 +564,7 @@ bot.command("launch", async (ctx) => {
   const id = parseIdArg(ctx.message.text);
   if (!id) return ctx.reply("Usage: /launch <proposal_id>");
 
-  runLaunchInBackground(ctx, () => runApiLaunch(ctx, id));
+  await sendLaunchConfirmation(ctx, "api", id);
 });
 
 bot.command("launchgroup", async (ctx) => {
@@ -549,7 +576,7 @@ bot.command("launchgroup", async (ctx) => {
   const id = parseIdArg(ctx.message.text);
   if (!id) return ctx.reply("Usage: /launchgroup <proposal_id>");
 
-  runLaunchInBackground(ctx, () => runGroupLaunch(ctx, id));
+  await sendLaunchConfirmation(ctx, "group", id);
 });
 
 bot.command("launchme", async (ctx) => {
@@ -558,7 +585,7 @@ bot.command("launchme", async (ctx) => {
   const id = parseIdArg(ctx.message.text);
   if (!id) return ctx.reply("Usage: /launchme <proposal_id>");
 
-  runLaunchInBackground(ctx, () => runPersonalLaunch(ctx, id));
+  await sendLaunchConfirmation(ctx, "personal", id);
 });
 
 bot.command("feesettings", async (ctx) => {
@@ -579,6 +606,7 @@ bot.command("cashback", async (ctx) => {
   if (proposal.launchpad !== "pumpfun") return ctx.reply("Cashback only applies to Pump.fun proposals.");
   const enabled = parseOnOff(value);
   const updated = updateProposalCashback(id, enabled);
+  audit(ctx, "cashback_updated", id, { enabled });
   return ctx.reply(feeSettingsMessage(updated ?? proposal), telegramReplyOptions);
 });
 
@@ -595,6 +623,7 @@ bot.command("setfees", async (ctx) => {
   if (proposal.launchpad !== "pumpfun") return ctx.reply("Fee sharing only applies to Pump.fun proposals.");
   const feeShares = normalizeFeeShareSetting(value);
   const updated = updateProposalFeeShares(id, feeShares);
+  audit(ctx, "fee_shares_updated", id, { feeShares });
   return ctx.reply(feeSettingsMessage(updated ?? proposal), telegramReplyOptions);
 });
 
@@ -615,6 +644,12 @@ bot.command("launchcheck", async (ctx) => {
     `Default dev buy: <b>${config.DEFAULT_DEV_BUY_SOL} SOL</b>`,
     `Slippage: <b>${config.DEFAULT_SLIPPAGE_PERCENT}%</b>`,
     `Priority fee: <b>${config.DEFAULT_PRIORITY_FEE_SOL} SOL</b>`,
+    `Platform fee: <b>${config.PLATFORM_FEE_SOL} SOL</b>`,
+    `Treasury wallet: <b>${config.PLATFORM_FEE_SOL > 0 ? (config.PLATFORM_TREASURY_WALLET ? "SET" : "MISSING") : "off"}</b>`,
+    `Max dev buy: <b>${config.MAX_DEV_BUY_SOL} SOL</b>`,
+    `Group daily launch limit: <b>${config.GROUP_DAILY_LAUNCH_LIMIT}</b>`,
+    `User daily launch limit: <b>${config.USER_DAILY_LAUNCH_LIMIT}</b>`,
+    `Rate limit: <b>${config.RATE_LIMIT_MAX_UPDATES} updates / ${Math.round(config.RATE_LIMIT_WINDOW_MS / 1000)}s</b>`,
     `Max image size: <b>${config.MAX_IMAGE_BYTES.toLocaleString()} bytes</b>`,
     `Image dimensions: <b>${config.MIN_IMAGE_DIMENSION}-${config.MAX_IMAGE_DIMENSION}px</b>`,
     `Square image required: <b>${config.REQUIRE_SQUARE_IMAGE ? "yes" : "no"}</b>`,
@@ -646,6 +681,49 @@ bot.command("launchcheck", async (ctx) => {
       ? "Set <code>DRY_RUN=false</code> only after your API key/wallet is funded and tested."
       : "Live launches are enabled. Approved proposals can spend funds."
   ].filter(Boolean);
+
+  return ctx.reply(lines.join("\n"), telegramReplyOptions);
+});
+
+bot.command("status", async (ctx) => {
+  if (!(await isBotAdmin(ctx))) return ctx.reply("Admin command only.");
+  const attempts = recentLaunchAttempts(6);
+  const jobs = recentLaunchJobs(6);
+  const uptimeSeconds = Math.floor((Date.now() - startedAt.getTime()) / 1000);
+  const lines = [
+    "<b>Bot Status</b>",
+    "",
+    `Mode: <b>${config.DRY_RUN ? "DRY RUN" : "LIVE"}</b>`,
+    `Uptime: <b>${Math.floor(uptimeSeconds / 60)}m ${uptimeSeconds % 60}s</b>`,
+    `Active launches: <b>${activeLaunches.size}</b>`,
+    `Queue worker: <b>${launchJobWorkerBusy ? "busy" : "idle"}</b>`,
+    `Rate buckets: <b>${rateBuckets.size}</b>`,
+    `Health port: <b>${config.HEALTHCHECK_PORT || "off"}</b>`,
+    "",
+    "<b>Recent Launch Jobs</b>",
+    jobs.length === 0
+      ? "None yet."
+      : jobs
+          .map((job) => {
+            const link = job.signature ? ` | <a href="https://solscan.io/tx/${escapeAttr(job.signature)}">tx</a>` : "";
+            const error = job.lastError ? ` | ${escapeHtml(job.lastError.slice(0, 90))}` : "";
+            return `Job ${job.id} #${job.proposalId} ${escapeHtml(job.mode)}: <b>${escapeHtml(job.status)}</b> (${job.attempts})${link}${error}`;
+          })
+          .join("\n"),
+    "",
+    "<b>Recent Launch Attempts</b>",
+    attempts.length === 0
+      ? "None yet."
+      : attempts
+          .map((attempt) => {
+            const suffix = attempt.signature ? ` | <a href="https://solscan.io/tx/${escapeAttr(attempt.signature)}">tx</a>` : "";
+            const error = attempt.error ? ` | ${escapeHtml(attempt.error.slice(0, 100))}` : "";
+            return `#${attempt.proposalId} ${escapeHtml(attempt.mode)} ${escapeHtml(attempt.launchpad)}: <b>${escapeHtml(
+              attempt.status
+            )}</b>${suffix}${error}`;
+          })
+          .join("\n")
+  ];
 
   return ctx.reply(lines.join("\n"), telegramReplyOptions);
 });
@@ -687,8 +765,8 @@ bot.action(/^launch:(\d+)$/, async (ctx) => {
   }
 
   const id = Number(ctx.match[1]);
-  await safeAnswerCallback(ctx, config.DRY_RUN ? "Starting dry run..." : "Starting API launch...");
-  runLaunchInBackground(ctx, () => runApiLaunch(ctx, id));
+  await safeAnswerCallback(ctx, "Confirm spend first.");
+  await sendLaunchConfirmation(ctx, "api", id);
 });
 
 bot.action(/^launch_group:(\d+)$/, async (ctx) => {
@@ -697,13 +775,53 @@ bot.action(/^launch_group:(\d+)$/, async (ctx) => {
     return;
   }
 
-  await safeAnswerCallback(ctx, "Starting group launch...");
-  runLaunchInBackground(ctx, () => runGroupLaunch(ctx, Number(ctx.match[1])));
+  await safeAnswerCallback(ctx, "Confirm spend first.");
+  await sendLaunchConfirmation(ctx, "group", Number(ctx.match[1]));
 });
 
 bot.action(/^launch_me:(\d+)$/, async (ctx) => {
-  await safeAnswerCallback(ctx, "Starting personal launch...");
-  runLaunchInBackground(ctx, () => runPersonalLaunch(ctx, Number(ctx.match[1])));
+  await safeAnswerCallback(ctx, "Confirm spend first.");
+  await sendLaunchConfirmation(ctx, "personal", Number(ctx.match[1]));
+});
+
+bot.action(/^confirm_launch:(api|group|personal):(\d+)$/, async (ctx) => {
+  const mode = ctx.match[1] as LaunchMode;
+  const id = Number(ctx.match[2]);
+  if (mode !== "personal" && !(await isBotAdmin(ctx))) {
+    await safeAnswerCallback(ctx, "Admin command only.");
+    return;
+  }
+
+  const proposal = getProposal(id);
+  if (!proposal) {
+    await safeAnswerCallback(ctx, "Proposal not found.");
+    return;
+  }
+  if (!ctx.chat?.id) {
+    await safeAnswerCallback(ctx, "Chat missing.");
+    return;
+  }
+
+  const job = enqueueLaunchJob({
+    proposalId: proposal.id,
+    launchpad: proposal.launchpad,
+    mode,
+    chatId: String(ctx.chat.id),
+    actorId: ctx.from?.id,
+    actorUsername: ctx.from?.username
+  });
+  audit(ctx, "launch_job_queued", id, { jobId: job.id, mode });
+  await safeAnswerCallback(ctx, `Queued job #${job.id}.`);
+  await ctx.reply(
+    `🧾 <b>Launch queued</b>\nJob: <code>${job.id}</code>\nProposal: <code>${id}</code>\nMode: <b>${escapeHtml(mode)}</b>`,
+    telegramReplyOptions
+  );
+  void processLaunchJobs();
+});
+
+bot.action(/^cancel_launch:(\d+)$/, async (ctx) => {
+  await safeAnswerCallback(ctx, "Cancelled.");
+  await ctx.reply(`Launch #${Number(ctx.match[1])} cancelled.`);
 });
 
 bot.action(/^cashback_toggle:(\d+)$/, async (ctx) => {
@@ -711,6 +829,7 @@ bot.action(/^cashback_toggle:(\d+)$/, async (ctx) => {
   if (!proposal) return safeAnswerCallback(ctx, "Proposal not found.");
   if (!(await canEditProposalSettings(ctx, proposal))) return safeAnswerCallback(ctx, "Creator or admin only.");
   const updated = updateProposalCashback(proposal.id, !proposal.pumpfunCashback);
+  audit(ctx, "cashback_updated", proposal.id, { enabled: updated?.pumpfunCashback ?? !proposal.pumpfunCashback });
   await safeAnswerCallback(ctx, updated?.pumpfunCashback ? "Cashback enabled." : "Cashback disabled.");
   await ctx.reply(feeSettingsMessage(updated ?? proposal), telegramReplyOptions);
 });
@@ -767,6 +886,7 @@ bot.action(/^fees_set:(\d+):(.+)$/, async (ctx) => {
   if (!proposal) return safeAnswerCallback(ctx, "Proposal not found.");
   if (!(await canEditProposalSettings(ctx, proposal))) return safeAnswerCallback(ctx, "Creator or admin only.");
   const updated = updateProposalFeeShares(proposal.id, normalizeFeeShareSetting(ctx.match[2]));
+  audit(ctx, "fee_shares_updated", proposal.id, { feeShares: updated?.pumpfunFeeShares });
   await safeAnswerCallback(ctx, "Fee settings updated.");
   await ctx.reply(feeSettingsMessage(updated ?? proposal), telegramReplyOptions);
 });
@@ -915,7 +1035,7 @@ bot.action(/^wizard:(.+)$/, async (ctx) => {
 });
 
 bot.catch((error, ctx) => {
-  console.error("Bot error", error);
+  logError("bot_error", error, { chatId: ctx.chat?.id, fromId: ctx.from?.id, updateType: ctx.updateType });
   void ctx.reply("Something went wrong. Check the bot logs.");
 });
 
@@ -938,11 +1058,67 @@ async function runApiLaunch(ctx: Context, id: number): Promise<void> {
       telegramReplyOptions
     );
 
-    const result = await launchProposal(proposal);
+    const attemptId = createLaunchAttempt({
+      proposalId: proposal.id,
+      launchpad: proposal.launchpad,
+      mode: "api",
+      chatId: ctx.chat?.id === undefined ? undefined : String(ctx.chat.id),
+      actorId: ctx.from?.id
+    });
+    let result: LaunchResult;
+    try {
+      result = await launchProposal(proposal);
+      finishLaunchAttempt(attemptId, {
+        status: result.dryRun ? "success" : "success",
+        signature: result.signature,
+        mint: result.mint
+      });
+    } catch (error) {
+      finishLaunchAttempt(attemptId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
     if (!result.dryRun) markLaunched(id, result.signature);
+    audit(ctx, "launch_api", id, { signature: result.signature, mint: result.mint });
     await safeDeleteMessage(ctx, progressMessage.message_id, "API launch progress");
     await replyLaunchResult(ctx, result);
   });
+}
+
+async function sendLaunchConfirmation(ctx: Context, mode: LaunchMode, id: number): Promise<void> {
+  const proposal = getProposal(id);
+  if (!proposal) return void (await ctx.reply(`Proposal #${id} not found.`));
+  const devBuySol = proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL;
+  const priorityFeeSol = priorityFeeForLaunchpad(proposal.launchpad);
+  const platformFeeSol = config.PLATFORM_FEE_SOL > 0 ? config.PLATFORM_FEE_SOL : 0;
+  const minimumTotal = devBuySol + priorityFeeSol + platformFeeSol + config.LOCAL_LAUNCH_MIN_SOL_BUFFER;
+
+  await ctx.reply(
+    [
+      `<b>Confirm Launch Spend #${proposal.id}</b>`,
+      "",
+      `<b>${escapeHtml(proposal.name)}</b> | <code>$${escapeHtml(proposal.symbol)}</code>`,
+      `Mode: <b>${mode === "api" ? "API" : mode === "group" ? "Group Wallet" : "Personal Wallet"}</b>`,
+      `Launchpad: <b>${escapeHtml(proposal.launchpad)}</b>`,
+      "",
+      `Dev buy: <b>${devBuySol} SOL</b>`,
+      `Priority fee: <b>${priorityFeeSol} SOL</b>`,
+      platformFeeSol > 0 ? `Platform fee: <b>${platformFeeSol} SOL</b>` : `Platform fee: <b>off</b>`,
+      `Required wallet minimum: <b>${minimumTotal.toFixed(6)} SOL</b>`,
+      "",
+      "Only continue if the metadata, image, wallet, and spend are correct."
+    ].join("\n"),
+    {
+      ...telegramReplyOptions,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "Confirm Launch", callback_data: `confirm_launch:${mode}:${id}` },
+            { text: "Cancel", callback_data: `cancel_launch:${id}` }
+          ]
+        ]
+      }
+    }
+  );
 }
 
 async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
@@ -960,7 +1136,10 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
 
   await withLaunchLock(ctx, `proposal:${id}`, async () => {
     const wallet = getPumpPortalApiKey("group", String(chatId));
-    const exportedWallet = proposal.launchpad === "pumpfun" ? exportPumpPortalWallet("group", String(chatId)) : undefined;
+    const exportedWallet =
+      proposal.launchpad === "pumpfun" || proposal.launchpad === "bonk"
+        ? exportPumpPortalWallet("group", String(chatId))
+        : undefined;
     if (!config.DRY_RUN) {
       await assertGroupLaunchReady(proposal, String(chatId), wallet.address);
     }
@@ -972,20 +1151,49 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
       telegramReplyOptions
     );
 
-    const result = config.DRY_RUN
-      ? {
-          launchpad: proposal.launchpad,
-          dryRun: true,
-          message: `Dry run only. Would launch ${proposal.name} ($${proposal.symbol}) from group wallet ${wallet.address}.`
-        }
-      : proposal.launchpad === "bags"
-        ? (() => {
-            throw new Error("Bags launches are disabled for this production release.");
-          })()
-        : proposal.launchpad === "bonk"
-          ? await launchWithPumpPortalApiKey(proposal, wallet.apiKey)
-          : await launchWithPumpFunSdk(proposal, exportedWallet?.secretKey ?? "", wallet.address);
+    const attemptId = createLaunchAttempt({
+      proposalId: proposal.id,
+      launchpad: proposal.launchpad,
+      mode: "group",
+      payerAddress: wallet.address,
+      chatId: String(chatId),
+      actorId: ctx.from?.id
+    });
+    let result: LaunchResult;
+    try {
+      result = config.DRY_RUN
+        ? {
+            launchpad: proposal.launchpad,
+            dryRun: true,
+            message: `Dry run only. Would launch ${proposal.name} ($${proposal.symbol}) from group wallet ${wallet.address}.`
+          }
+        : proposal.launchpad === "bags"
+          ? (() => {
+              throw new Error("Bags launches are disabled for this production release.");
+            })()
+          : proposal.launchpad === "bonk"
+            ? await launchWithPumpPortalApiKey(proposal, wallet.apiKey)
+            : await launchWithPumpFunSdk(proposal, exportedWallet?.secretKey ?? "", wallet.address);
+    } catch (error) {
+      finishLaunchAttempt(attemptId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+    if (!result.dryRun && proposal.launchpad === "bonk" && exportedWallet) {
+      const platformFee: PlatformFeeResult = await sendPlatformFeeIfEnabled(exportedWallet.secretKey, wallet.address).catch(
+        (error): PlatformFeeResult => ({
+          error: error instanceof Error ? error.message : String(error)
+        })
+      );
+      result = {
+        ...result,
+        platformFeeSignature: platformFee.signature,
+        platformFeeUrl: platformFee.url,
+        platformFeeError: platformFee.error
+      };
+    }
     if (!result.dryRun) markLaunched(id, result.signature);
+    finishLaunchAttempt(attemptId, { status: "success", signature: result.signature, mint: result.mint });
+    audit(ctx, "launch_group", id, { signature: result.signature, mint: result.mint, payerAddress: wallet.address });
     await safeDeleteMessage(ctx, progressMessage.message_id, "group launch progress");
     await replyLaunchResult(ctx, result);
   });
@@ -1022,18 +1230,196 @@ async function runPersonalLaunch(ctx: Context, id: number): Promise<void> {
       telegramReplyOptions
     );
 
-    const result = config.DRY_RUN
-      ? {
-          launchpad: proposal.launchpad,
-          dryRun: true,
-          message: `Dry run only. Would launch ${proposal.name} ($${proposal.symbol}) from personal wallet ${wallet.address}.`
-        }
-      : await launchWithPumpFunSdk(proposal, exportWalletSecretBase58("user", String(ctx.from!.id)).secretKey, wallet.address);
+    const attemptId = createLaunchAttempt({
+      proposalId: proposal.id,
+      launchpad: proposal.launchpad,
+      mode: "personal",
+      payerAddress: wallet.address,
+      chatId: ctx.chat?.id === undefined ? undefined : String(ctx.chat.id),
+      actorId: ctx.from!.id
+    });
+    let result: LaunchResult;
+    try {
+      result = config.DRY_RUN
+        ? {
+            launchpad: proposal.launchpad,
+            dryRun: true,
+            message: `Dry run only. Would launch ${proposal.name} ($${proposal.symbol}) from personal wallet ${wallet.address}.`
+          }
+        : await launchWithPumpFunSdk(proposal, exportWalletSecretBase58("user", String(ctx.from!.id)).secretKey, wallet.address);
+      finishLaunchAttempt(attemptId, { status: "success", signature: result.signature, mint: result.mint });
+    } catch (error) {
+      finishLaunchAttempt(attemptId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
 
     if (!result.dryRun) markLaunched(id, result.signature);
+    audit(ctx, "launch_personal", id, { signature: result.signature, mint: result.mint, payerAddress: wallet.address });
     await safeDeleteMessage(ctx, progressMessage.message_id, "personal launch progress");
     await replyLaunchResult(ctx, result);
   });
+}
+
+async function processLaunchJobs(): Promise<void> {
+  if (launchJobWorkerBusy) return;
+  launchJobWorkerBusy = true;
+  try {
+    while (true) {
+      const job = claimNextLaunchJob(config.LAUNCH_JOB_MAX_ATTEMPTS);
+      if (!job) return;
+      await executeLaunchJob(job);
+    }
+  } finally {
+    launchJobWorkerBusy = false;
+  }
+}
+
+async function executeLaunchJob(job: {
+  id: number;
+  proposalId: number;
+  launchpad: string;
+  mode: LaunchMode;
+  chatId: string;
+  actorId?: number;
+}): Promise<void> {
+  const lockKey = job.mode === "personal" ? `personal:${job.actorId}:${job.proposalId}` : `proposal:${job.proposalId}`;
+  if (activeLaunches.has(lockKey)) {
+    failLaunchJob(job.id, "Launch is already active; retrying shortly.", config.LAUNCH_JOB_POLL_MS * 2, config.LAUNCH_JOB_MAX_ATTEMPTS);
+    return;
+  }
+
+  activeLaunches.add(lockKey);
+  try {
+    const proposal = getProposal(job.proposalId);
+    if (!proposal) throw new Error(`Proposal #${job.proposalId} not found.`);
+    if (proposal.status !== "approved") throw new Error(`Proposal #${job.proposalId} is ${proposal.status}; expected approved.`);
+
+    let payerAddress: string | undefined;
+    if (job.mode === "group") {
+      const wallet = getPumpPortalApiKey("group", job.chatId);
+      payerAddress = wallet.address;
+      if (!config.DRY_RUN) await assertGroupLaunchReady(proposal, job.chatId, wallet.address);
+    } else if (job.mode === "personal") {
+      if (!job.actorId) throw new Error("Personal launch job is missing actor id.");
+      const wallet = await getOrCreateWallet("user", String(job.actorId));
+      payerAddress = wallet.address;
+      if (!config.DRY_RUN) await assertPersonalLaunchReady(proposal, wallet.address);
+    } else if (!config.DRY_RUN) {
+      await assertApiLaunchReady(proposal);
+    }
+
+    const progressMessage = await bot.telegram.sendMessage(
+      job.chatId,
+      config.DRY_RUN
+        ? `🧪 <b>Running queued dry launch job #${job.id} for #${job.proposalId}...</b>`
+        : `🚀 <b>Running queued launch job #${job.id} for #${job.proposalId}...</b>\nThis can take a moment while metadata uploads.`,
+      telegramReplyOptions
+    );
+
+    const attemptId = createLaunchAttempt({
+      proposalId: proposal.id,
+      launchpad: proposal.launchpad,
+      mode: job.mode,
+      payerAddress,
+      chatId: job.chatId,
+      actorId: job.actorId
+    });
+
+    let result: LaunchResult;
+    try {
+      result = await runQueuedLaunch(proposal, job.mode, job.chatId, job.actorId);
+      finishLaunchAttempt(attemptId, { status: "success", signature: result.signature, mint: result.mint });
+    } catch (error) {
+      finishLaunchAttempt(attemptId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+
+    if (!result.dryRun) markLaunched(job.proposalId, result.signature);
+    completeLaunchJob(job.id, result.signature, result.mint);
+    createAuditLog({
+      action: `launch_job_${job.mode}_success`,
+      actorId: job.actorId,
+      chatId: job.chatId,
+      proposalId: job.proposalId,
+      details: { jobId: job.id, signature: result.signature, mint: result.mint, payerAddress }
+    });
+
+    await bot.telegram.deleteMessage(job.chatId, progressMessage.message_id).catch(() => undefined);
+    await bot.telegram.sendMessage(job.chatId, launchMessage(result), {
+      ...telegramReplyOptions,
+      ...(launchKeyboard(result) ? { reply_markup: { inline_keyboard: launchKeyboard(result)! } } : {})
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const retryable = isRetryableLaunchJobError(error);
+    failLaunchJob(job.id, message, config.LAUNCH_RETRY_DELAY_MS, retryable ? config.LAUNCH_JOB_MAX_ATTEMPTS : 0);
+    logError("launch_job_failed", error, { jobId: job.id, proposalId: job.proposalId, mode: job.mode, retryable });
+    await bot.telegram.sendMessage(
+      job.chatId,
+      formatError(
+        retryable
+          ? `Launch job #${job.id} failed and will retry if attempts remain:\n${message}`
+          : `Launch job #${job.id} failed and will not retry automatically:\n${message}`
+      ),
+      telegramReplyOptions
+    );
+  } finally {
+    activeLaunches.delete(lockKey);
+  }
+}
+
+async function runQueuedLaunch(
+  proposal: Proposal,
+  mode: LaunchMode,
+  chatId: string,
+  actorId?: number
+): Promise<LaunchResult> {
+  if (config.DRY_RUN) {
+    return {
+      launchpad: proposal.launchpad,
+      dryRun: true,
+      message: `Dry run only. Would launch ${proposal.name} ($${proposal.symbol}) with ${mode} mode.`
+    };
+  }
+
+  if (mode === "api") return launchProposal(proposal);
+
+  if (mode === "group") {
+    const wallet = getPumpPortalApiKey("group", chatId);
+    const exportedWallet =
+      proposal.launchpad === "pumpfun" || proposal.launchpad === "bonk" ? exportPumpPortalWallet("group", chatId) : undefined;
+    let result =
+      proposal.launchpad === "bonk"
+        ? await launchWithPumpPortalApiKey(proposal, wallet.apiKey)
+        : await launchWithPumpFunSdk(proposal, exportedWallet?.secretKey ?? "", wallet.address);
+    if (!result.dryRun && proposal.launchpad === "bonk" && exportedWallet) {
+      const platformFee: PlatformFeeResult = await sendPlatformFeeIfEnabled(exportedWallet.secretKey, wallet.address).catch(
+        (error): PlatformFeeResult => ({
+          error: error instanceof Error ? error.message : String(error)
+        })
+      );
+      result = {
+        ...result,
+        platformFeeSignature: platformFee.signature,
+        platformFeeUrl: platformFee.url,
+        platformFeeError: platformFee.error
+      };
+    }
+    return result;
+  }
+
+  if (!actorId) throw new Error("Personal launch job is missing actor id.");
+  const wallet = await getOrCreateWallet("user", String(actorId));
+  return launchWithPumpFunSdk(proposal, exportWalletSecretBase58("user", String(actorId)).secretKey, wallet.address);
+}
+
+function isRetryableLaunchJobError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/submitted|signature|solscan|not confirmed|confirmed later|on-chain|already landed/i.test(message)) return false;
+  if (/insufficient|needs more SOL|daily launch limit|MAX_DEV_BUY|missing|invalid|rejected|not found|expected approved/i.test(message)) {
+    return false;
+  }
+  return isTransientNetworkError(error) || /fetch failed|timeout|ECONNRESET|429|500|502|503|504/i.test(message);
 }
 
 async function assertGroupLaunchReady(proposal: Proposal, groupId: string, walletAddress: string): Promise<void> {
@@ -1041,9 +1427,19 @@ async function assertGroupLaunchReady(proposal: Proposal, groupId: string, walle
   const suffix = mintSuffixForLaunchpad(proposal.launchpad);
   const devBuySol = proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL;
   const priorityFeeSol = priorityFeeForLaunchpad(proposal.launchpad);
-  const requiredSol = devBuySol + priorityFeeSol + config.LOCAL_LAUNCH_MIN_SOL_BUFFER;
+  const platformFeeSol = config.PLATFORM_FEE_SOL > 0 ? config.PLATFORM_FEE_SOL : 0;
+  const requiredSol = devBuySol + priorityFeeSol + platformFeeSol + config.LOCAL_LAUNCH_MIN_SOL_BUFFER;
 
+  if (devBuySol > config.MAX_DEV_BUY_SOL) problems.push(`dev buy ${devBuySol} SOL exceeds MAX_DEV_BUY_SOL ${config.MAX_DEV_BUY_SOL} SOL`);
+  const groupLaunchesToday = countSuccessfulLaunchesSince("chat", groupId, dayAgoIso());
+  if (groupLaunchesToday >= config.GROUP_DAILY_LAUNCH_LIMIT) {
+    problems.push(`group daily launch limit reached (${groupLaunchesToday}/${config.GROUP_DAILY_LAUNCH_LIMIT})`);
+  }
   if (!proposal.image) problems.push("proposal has no image");
+  if (platformFeeSol > 0 && !config.PLATFORM_TREASURY_WALLET) problems.push("PLATFORM_TREASURY_WALLET is missing");
+  if (platformFeeSol > 0 && config.PLATFORM_TREASURY_WALLET && !isValidSolanaAddress(config.PLATFORM_TREASURY_WALLET)) {
+    problems.push("PLATFORM_TREASURY_WALLET is not a valid Solana wallet address");
+  }
   if (proposal.launchpad === "bags") problems.push("Bags launches are disabled for this production release");
   if (proposal.launchpad === "pumpfun" && !config.PINATA_JWT) problems.push("PINATA_JWT is missing");
   if (suffix && countAvailableVanityMints(suffix) < 1) {
@@ -1062,7 +1458,7 @@ async function assertGroupLaunchReady(proposal: Proposal, groupId: string, walle
     const balance = await getSolBalance(walletAddress);
     if (balance < requiredSol) {
       problems.push(
-        `group wallet has ${balance.toFixed(6)} SOL; needs at least ${requiredSol.toFixed(6)} SOL for dev buy, fees, and rent`
+        `group wallet has ${balance.toFixed(6)} SOL; needs at least ${requiredSol.toFixed(6)} SOL for dev buy, platform fee, fees, and rent`
       );
     }
   } catch (error) {
@@ -1099,10 +1495,20 @@ async function assertPersonalLaunchReady(proposal: Proposal, walletAddress: stri
   const suffix = mintSuffixForLaunchpad(proposal.launchpad);
   const devBuySol = proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL;
   const priorityFeeSol = priorityFeeForLaunchpad(proposal.launchpad);
-  const requiredSol = devBuySol + priorityFeeSol + config.LOCAL_LAUNCH_MIN_SOL_BUFFER;
+  const platformFeeSol = config.PLATFORM_FEE_SOL > 0 ? config.PLATFORM_FEE_SOL : 0;
+  const requiredSol = devBuySol + priorityFeeSol + platformFeeSol + config.LOCAL_LAUNCH_MIN_SOL_BUFFER;
 
+  if (devBuySol > config.MAX_DEV_BUY_SOL) problems.push(`dev buy ${devBuySol} SOL exceeds MAX_DEV_BUY_SOL ${config.MAX_DEV_BUY_SOL} SOL`);
+  const personalLaunchesToday = countSuccessfulLaunchesSince("actor", proposal.createdBy, dayAgoIso());
+  if (personalLaunchesToday >= config.USER_DAILY_LAUNCH_LIMIT) {
+    problems.push(`personal daily launch limit reached (${personalLaunchesToday}/${config.USER_DAILY_LAUNCH_LIMIT})`);
+  }
   if (proposal.launchpad !== "pumpfun") problems.push("personal launch currently supports Pump.fun only");
   if (!proposal.image) problems.push("proposal has no image");
+  if (platformFeeSol > 0 && !config.PLATFORM_TREASURY_WALLET) problems.push("PLATFORM_TREASURY_WALLET is missing");
+  if (platformFeeSol > 0 && config.PLATFORM_TREASURY_WALLET && !isValidSolanaAddress(config.PLATFORM_TREASURY_WALLET)) {
+    problems.push("PLATFORM_TREASURY_WALLET is not a valid Solana wallet address");
+  }
   if (!config.PINATA_JWT) problems.push("PINATA_JWT is missing");
   if (suffix && countAvailableVanityMints(suffix) < 1) {
     problems.push(`no ${proposal.launchpad} vanity mints available for suffix "${suffix}"`);
@@ -1112,7 +1518,7 @@ async function assertPersonalLaunchReady(proposal: Proposal, walletAddress: stri
     const balance = await getSolBalance(walletAddress);
     if (balance < requiredSol) {
       problems.push(
-        `personal wallet has ${balance.toFixed(6)} SOL; needs at least ${requiredSol.toFixed(6)} SOL for dev buy, fees, and rent`
+        `personal wallet has ${balance.toFixed(6)} SOL; needs at least ${requiredSol.toFixed(6)} SOL for dev buy, platform fee, fees, and rent`
       );
     }
   } catch (error) {
@@ -1147,7 +1553,9 @@ async function assertPersonalLaunchReady(proposal: Proposal, walletAddress: stri
 async function assertApiLaunchReady(proposal: Proposal): Promise<void> {
   const problems: string[] = [];
   const suffix = mintSuffixForLaunchpad(proposal.launchpad);
+  const devBuySol = proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL;
 
+  if (devBuySol > config.MAX_DEV_BUY_SOL) problems.push(`dev buy ${devBuySol} SOL exceeds MAX_DEV_BUY_SOL ${config.MAX_DEV_BUY_SOL} SOL`);
   if (proposal.launchpad === "bags") {
     problems.push("Bags launches must use Launch Group");
   }
@@ -1155,6 +1563,13 @@ async function assertApiLaunchReady(proposal: Proposal): Promise<void> {
     problems.push("PUMPFUN_SIGNER_PRIVATE_KEY is missing");
   }
   if (proposal.launchpad === "bonk" && !config.PUMPPORTAL_API_KEY) problems.push("PUMPPORTAL_API_KEY is missing");
+  if (proposal.launchpad === "bonk" && config.PLATFORM_FEE_SOL > 0) {
+    problems.push("per-launch platform fee requires group-wallet launch for Bonk");
+  }
+  if (config.PLATFORM_FEE_SOL > 0 && !config.PLATFORM_TREASURY_WALLET) problems.push("PLATFORM_TREASURY_WALLET is missing");
+  if (config.PLATFORM_FEE_SOL > 0 && config.PLATFORM_TREASURY_WALLET && !isValidSolanaAddress(config.PLATFORM_TREASURY_WALLET)) {
+    problems.push("PLATFORM_TREASURY_WALLET is not a valid Solana wallet address");
+  }
   if (proposal.launchpad === "pumpfun" && !config.PINATA_JWT) problems.push("PINATA_JWT is missing");
   if (!proposal.image) problems.push("proposal has no image");
   if (suffix && countAvailableVanityMints(suffix) < 1) {
@@ -1191,6 +1606,19 @@ function mintSuffixForLaunchpad(launchpad: Launchpad): string {
 function priorityFeeForLaunchpad(launchpad: Launchpad): number {
   if (launchpad === "bonk") return Math.max(config.DEFAULT_PRIORITY_FEE_SOL, 0.0005);
   return config.DEFAULT_PRIORITY_FEE_SOL;
+}
+
+function dayAgoIso(): string {
+  return new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+}
+
+function isValidSolanaAddress(address: string): boolean {
+  try {
+    new PublicKey(address);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function parseOnOff(value: string): boolean {
@@ -1292,7 +1720,7 @@ async function withLaunchLock(ctx: Context, key: string, run: () => Promise<void
 
 function runLaunchInBackground(ctx: Context, run: () => Promise<void>): void {
   void run().catch((error) => {
-    console.error("Background launch failed", error);
+    logError("background_launch_failed", error, { chatId: ctx.chat?.id, fromId: ctx.from?.id });
     void ctx.reply(formatError(error), telegramReplyOptions);
   });
 }
@@ -1341,11 +1769,13 @@ async function validateAndApproveFromButton(ctx: Context, id: number, adminId: n
     return;
   }
 
+  await assertApprovalImageValid(pendingProposal);
   const proposal = approveProposal(id, adminId);
   if (!proposal) {
     await ctx.reply(`Proposal #${id} not found.`);
     return;
   }
+  audit(ctx, "proposal_approved", id, { launchpad: proposal.launchpad, devBuySol: proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL });
 
   await ctx.reply(proposalMessage(proposal, "Approved"), {
     ...telegramReplyOptions,
@@ -1669,6 +2099,7 @@ async function applyRejectionText(
     await ctx.reply(`Proposal #${draft.proposalId} not found or cannot be rejected.`);
     return;
   }
+  audit(ctx, "proposal_rejected", proposal.id, { reason });
 
   await ctx.reply(
     [`<b>Rejected #${proposal.id}</b>`, "", escapeHtml(reason)].join("\n"),
@@ -1809,7 +2240,7 @@ async function isBotAdmin(ctx: Context): Promise<boolean> {
     const member = await ctx.getChatMember(userId);
     return member.status === "creator" || member.status === "administrator";
   } catch (error) {
-    console.error("Failed to check group admin status", error);
+    logError("group_admin_check_failed", error, { chatId: ctx.chat?.id, fromId: userId });
     return false;
   }
 }
@@ -1838,7 +2269,58 @@ function describeUnknownError(error: unknown): string {
   return String(error);
 }
 
+function audit(ctx: Context, action: string, proposalId?: number, details?: unknown): void {
+  createAuditLog({
+    action,
+    actorId: ctx.from?.id,
+    actorUsername: ctx.from?.username,
+    chatId: ctx.chat?.id === undefined ? undefined : String(ctx.chat.id),
+    proposalId,
+    details
+  });
+  logInfo("audit", { action, proposalId, actorId: ctx.from?.id, chatId: ctx.chat?.id, details });
+}
+
+function isRateLimited(chatId: string, fromId: string): boolean {
+  const now = Date.now();
+  const key = `${chatId}:${fromId}`;
+  const bucket = rateBuckets.get(key);
+  if (!bucket || bucket.resetAt <= now) {
+    rateBuckets.set(key, { count: 1, resetAt: now + config.RATE_LIMIT_WINDOW_MS });
+    return false;
+  }
+
+  bucket.count += 1;
+  if (bucket.count > config.RATE_LIMIT_MAX_UPDATES) {
+    logInfo("rate_limited", { chatId, fromId, count: bucket.count });
+    return true;
+  }
+  return false;
+}
+
+function startHealthServer(): void {
+  if (!config.HEALTHCHECK_PORT) return;
+
+  const server = http.createServer((_, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify({
+        ok: true,
+        mode: config.DRY_RUN ? "dry-run" : "live",
+        uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
+        activeLaunches: activeLaunches.size
+      })
+    );
+  });
+
+  server.listen(config.HEALTHCHECK_PORT, () => {
+    logInfo("health_server_started", { port: config.HEALTHCHECK_PORT });
+  });
+}
+
 console.log("Starting Telegram launchpad bot...");
+startHealthServer();
+setInterval(() => void processLaunchJobs().catch((error) => logError("launch_job_worker_tick_failed", error)), config.LAUNCH_JOB_POLL_MS);
 void launchBotWithRetry();
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
@@ -1855,8 +2337,7 @@ async function launchBotWithRetry(): Promise<void> {
       return;
     } catch (error) {
       const delayMs = Math.min(60_000, 2_000 * attempt);
-      console.error(`Telegram polling failed on startup attempt ${attempt}: ${error instanceof Error ? error.message : String(error)}`);
-      console.error(`Retrying in ${Math.round(delayMs / 1000)}s...`);
+      logError("telegram_polling_start_failed", error, { attempt, retryInSeconds: Math.round(delayMs / 1000) });
       await new Promise((resolve) => setTimeout(resolve, delayMs));
       attempt += 1;
     }
@@ -1879,6 +2360,7 @@ async function setupBotCommands(): Promise<void> {
     { command: "exportgroupwallet", description: "DM admin: export a group wallet" },
     { command: "exportmywallet", description: "DM admin: export your personal wallet" },
     { command: "launchcheck", description: "Check launch readiness" },
+    { command: "status", description: "Admin status and recent launch attempts" },
     { command: "proposal", description: "Show a proposal by ID" },
     { command: "imagetest", description: "Validate a proposal image" },
     { command: "txcheck", description: "Check a launch transaction/CA" },

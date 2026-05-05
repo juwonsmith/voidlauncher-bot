@@ -138,6 +138,7 @@ export function commandHelpMessage(): string {
     "<code>/setfees &lt;id&gt; none|creator|wallet:bps,...</code> - set Pump.fun fee sharing before launch",
     "<code>/feesettings &lt;id&gt;</code> - show Pump.fun fee settings",
     "<code>/launchcheck</code> - check production readiness",
+    "<code>/status</code> - uptime, active launches, recent launch attempts",
     "<code>/groupwallet</code> - create/show group wallet",
     "<code>/groupbalance</code> - check group wallet balance",
     "<code>/mywallet</code> - create/show your personal launch wallet",
@@ -160,6 +161,8 @@ export function launchMessage(result: LaunchResult): string {
     result.dryRun ? `&#129514; <b>${escapeHtml(result.message)}</b>` : `&#128640; ${escapeHtml(result.message)}`,
     result.feeSharingUrl ? `&#129309; Fee Share: <a href="${escapeAttr(result.feeSharingUrl)}">Locked</a>` : undefined,
     result.feeSharingError ? `&#9888; Fee Share: ${escapeHtml(result.feeSharingError)}` : undefined,
+    result.platformFeeUrl ? `&#128188; Platform Fee: <a href="${escapeAttr(result.platformFeeUrl)}">Paid</a>` : undefined,
+    result.platformFeeError ? `&#9888; Platform Fee: ${escapeHtml(result.platformFeeError)}` : undefined,
     result.mint ? `&#129689; CA: <code>${escapeHtml(result.mint)}</code>` : undefined,
     result.explorerUrl ? `&#128269; Solscan: <a href="${escapeAttr(result.explorerUrl)}">Solscan</a>` : undefined,
     links.length > 0 ? `&#128279; Links: ${links.join(" | ")}` : undefined
