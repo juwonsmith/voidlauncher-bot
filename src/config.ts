@@ -66,7 +66,7 @@ const envSchema = z.object({
     .string()
     .default("true")
     .transform((value) => value.toLowerCase() !== "false"),
-  HEALTHCHECK_PORT: z.coerce.number().int().positive().default(0),
+  HEALTHCHECK_PORT: z.coerce.number().int().min(0).default(0),
   LOG_DIR: z.string().default("./logs"),
   WALLET_ENCRYPTION_KEY: z.string().optional()
 });
