@@ -648,9 +648,9 @@ bot.command("launchcheck", async (ctx) => {
     `Priority fee: <b>${config.DEFAULT_PRIORITY_FEE_SOL} SOL</b>`,
     `Platform fee: <b>${config.PLATFORM_FEE_SOL} SOL</b>`,
     `Treasury wallet: <b>${config.PLATFORM_FEE_SOL > 0 ? (config.PLATFORM_TREASURY_WALLET ? "SET" : "MISSING") : "off"}</b>`,
-    `Max dev buy: <b>${config.MAX_DEV_BUY_SOL} SOL</b>`,
-    `Group daily launch limit: <b>${config.GROUP_DAILY_LAUNCH_LIMIT}</b>`,
-    `User daily launch limit: <b>${config.USER_DAILY_LAUNCH_LIMIT}</b>`,
+    `Max dev buy: <b>${config.MAX_DEV_BUY_SOL > 0 ? `${config.MAX_DEV_BUY_SOL} SOL` : "unlimited"}</b>`,
+    `Group daily launch limit: <b>${config.GROUP_DAILY_LAUNCH_LIMIT > 0 ? config.GROUP_DAILY_LAUNCH_LIMIT : "unlimited"}</b>`,
+    `User daily launch limit: <b>${config.USER_DAILY_LAUNCH_LIMIT > 0 ? config.USER_DAILY_LAUNCH_LIMIT : "unlimited"}</b>`,
     `Rate limit: <b>${config.RATE_LIMIT_MAX_UPDATES} updates / ${Math.round(config.RATE_LIMIT_WINDOW_MS / 1000)}s</b>`,
     `Max image size: <b>${config.MAX_IMAGE_BYTES.toLocaleString()} bytes</b>`,
     `Image dimensions: <b>${config.MIN_IMAGE_DIMENSION}-${config.MAX_IMAGE_DIMENSION}px</b>`,
@@ -1434,9 +1434,11 @@ async function assertGroupLaunchReady(proposal: Proposal, groupId: string, walle
   const platformFeeSol = config.PLATFORM_FEE_SOL > 0 ? config.PLATFORM_FEE_SOL : 0;
   const requiredSol = devBuySol + priorityFeeSol + platformFeeSol + config.LOCAL_LAUNCH_MIN_SOL_BUFFER;
 
-  if (devBuySol > config.MAX_DEV_BUY_SOL) problems.push(`dev buy ${devBuySol} SOL exceeds MAX_DEV_BUY_SOL ${config.MAX_DEV_BUY_SOL} SOL`);
-  const groupLaunchesToday = countSuccessfulLaunchesSince("chat", groupId, dayAgoIso());
-  if (groupLaunchesToday >= config.GROUP_DAILY_LAUNCH_LIMIT) {
+  if (config.MAX_DEV_BUY_SOL > 0 && devBuySol > config.MAX_DEV_BUY_SOL) {
+    problems.push(`dev buy ${devBuySol} SOL exceeds MAX_DEV_BUY_SOL ${config.MAX_DEV_BUY_SOL} SOL`);
+  }
+  const groupLaunchesToday = config.GROUP_DAILY_LAUNCH_LIMIT > 0 ? countSuccessfulLaunchesSince("chat", groupId, dayAgoIso()) : 0;
+  if (config.GROUP_DAILY_LAUNCH_LIMIT > 0 && groupLaunchesToday >= config.GROUP_DAILY_LAUNCH_LIMIT) {
     problems.push(`group daily launch limit reached (${groupLaunchesToday}/${config.GROUP_DAILY_LAUNCH_LIMIT})`);
   }
   if (!proposal.image) problems.push("proposal has no image");
@@ -1505,9 +1507,12 @@ async function assertPersonalLaunchReady(proposal: Proposal, walletAddress: stri
   const platformFeeSol = config.PLATFORM_FEE_SOL > 0 ? config.PLATFORM_FEE_SOL : 0;
   const requiredSol = devBuySol + priorityFeeSol + platformFeeSol + config.LOCAL_LAUNCH_MIN_SOL_BUFFER;
 
-  if (devBuySol > config.MAX_DEV_BUY_SOL) problems.push(`dev buy ${devBuySol} SOL exceeds MAX_DEV_BUY_SOL ${config.MAX_DEV_BUY_SOL} SOL`);
-  const personalLaunchesToday = countSuccessfulLaunchesSince("actor", proposal.createdBy, dayAgoIso());
-  if (personalLaunchesToday >= config.USER_DAILY_LAUNCH_LIMIT) {
+  if (config.MAX_DEV_BUY_SOL > 0 && devBuySol > config.MAX_DEV_BUY_SOL) {
+    problems.push(`dev buy ${devBuySol} SOL exceeds MAX_DEV_BUY_SOL ${config.MAX_DEV_BUY_SOL} SOL`);
+  }
+  const personalLaunchesToday =
+    config.USER_DAILY_LAUNCH_LIMIT > 0 ? countSuccessfulLaunchesSince("actor", proposal.createdBy, dayAgoIso()) : 0;
+  if (config.USER_DAILY_LAUNCH_LIMIT > 0 && personalLaunchesToday >= config.USER_DAILY_LAUNCH_LIMIT) {
     problems.push(`personal daily launch limit reached (${personalLaunchesToday}/${config.USER_DAILY_LAUNCH_LIMIT})`);
   }
   if (proposal.launchpad !== "pumpfun") problems.push("personal launch currently supports Pump.fun only");
@@ -1562,7 +1567,9 @@ async function assertApiLaunchReady(proposal: Proposal): Promise<void> {
   const suffix = mintSuffixForLaunchpad(proposal.launchpad);
   const devBuySol = proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL;
 
-  if (devBuySol > config.MAX_DEV_BUY_SOL) problems.push(`dev buy ${devBuySol} SOL exceeds MAX_DEV_BUY_SOL ${config.MAX_DEV_BUY_SOL} SOL`);
+  if (config.MAX_DEV_BUY_SOL > 0 && devBuySol > config.MAX_DEV_BUY_SOL) {
+    problems.push(`dev buy ${devBuySol} SOL exceeds MAX_DEV_BUY_SOL ${config.MAX_DEV_BUY_SOL} SOL`);
+  }
   if (proposal.launchpad === "bags") {
     problems.push("Bags launches should use Launch Group so the encrypted group wallet signs the launch");
   }

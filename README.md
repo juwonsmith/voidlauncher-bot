@@ -83,9 +83,9 @@ When enabled, the bot adds the platform fee to preflight balance checks and send
 Production controls:
 
 ```env
-MAX_DEV_BUY_SOL=0.05
-GROUP_DAILY_LAUNCH_LIMIT=10
-USER_DAILY_LAUNCH_LIMIT=3
+MAX_DEV_BUY_SOL=0
+GROUP_DAILY_LAUNCH_LIMIT=0
+USER_DAILY_LAUNCH_LIMIT=0
 RATE_LIMIT_WINDOW_MS=10000
 RATE_LIMIT_MAX_UPDATES=12
 LOG_DIR=./logs
@@ -93,6 +93,7 @@ HEALTHCHECK_PORT=3001
 ```
 
 Every live launch now requires a final spend confirmation button. The bot writes admin actions and launch attempts to SQLite, and writes searchable JSONL logs to `logs/app.jsonl` and `logs/error.jsonl`. Use `/status` for recent launch attempts and uptime.
+Set `MAX_DEV_BUY_SOL`, `GROUP_DAILY_LAUNCH_LIMIT`, or `USER_DAILY_LAUNCH_LIMIT` to `0` to make that control unlimited. `DEFAULT_DEV_BUY_SOL` is only the default wizard value.
 
 Launches confirmed through the bot are stored in a persistent `launch_jobs` queue. If the bot restarts before a queued job runs, it resumes from the database on startup. See `docs/production.md` for the AWS runbook and Postgres scale path.
 
