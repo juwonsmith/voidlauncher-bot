@@ -28,6 +28,7 @@ import {
   updateProposalFeeShares
 } from "./db.js";
 import { launchProposal } from "./launchpads/index.js";
+import { launchWithBags } from "./launchpads/bags.js";
 import {
   launchWithPumpFunSdk,
   launchWithPumpPortalApiKey,
@@ -640,6 +641,7 @@ bot.command("launchcheck", async (ctx) => {
     `Mode: <b>${config.DRY_RUN ? "DRY RUN" : "LIVE"}</b>`,
     `Pump.fun SDK signer: <b>${config.PUMPFUN_SIGNER_PRIVATE_KEY ? "SET" : "MISSING"}</b>`,
     `PumpPortal API key (Bonk): <b>${config.PUMPPORTAL_API_KEY ? "SET" : "MISSING"}</b>`,
+    `Bags API key: <b>${config.BAGS_API_KEY ? "SET" : "MISSING"}</b>`,
     `Pinata JWT: <b>${config.PINATA_JWT ? "SET" : "MISSING"}</b>`,
     `Default dev buy: <b>${config.DEFAULT_DEV_BUY_SOL} SOL</b>`,
     `Slippage: <b>${config.DEFAULT_SLIPPAGE_PERCENT}%</b>`,
@@ -666,7 +668,7 @@ bot.command("launchcheck", async (ctx) => {
     config.BONK_MINT_SUFFIX
       ? `Bonk vanity mints ready: <b>${countAvailableVanityMints(config.BONK_MINT_SUFFIX).toLocaleString()}</b>`
       : undefined,
-    `Bags launches: <b>disabled</b>`,
+    `Bags mint suffix: <b>${config.BAGS_MINT_SUFFIX || "none"}</b>`,
     ctx.chat?.type === "group" || ctx.chat?.type === "supergroup" ? "" : undefined,
     ctx.chat?.type === "group" || ctx.chat?.type === "supergroup"
       ? `<b>Group Wallet</b>: ${groupWallet ? `<code>${escapeHtml(groupWallet.address)}</code>` : "MISSING"}`
@@ -945,8 +947,8 @@ bot.action(/^wizard:(.+)$/, async (ctx) => {
   try {
     if (action.startsWith("launchpad:")) {
       const launchpad = action.split(":")[1];
-      if (launchpad !== "pumpfun" && launchpad !== "bonk") {
-        throw new Error("Invalid launchpad. Bags launches are disabled for now.");
+      if (launchpad !== "pumpfun" && launchpad !== "bonk" && launchpad !== "bags") {
+        throw new Error("Invalid launchpad.");
       }
       draft.data.launchpad = launchpad;
       await ctx.answerCbQuery(`Selected ${launchpad}.`);
@@ -1137,7 +1139,7 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
   await withLaunchLock(ctx, `proposal:${id}`, async () => {
     const wallet = getPumpPortalApiKey("group", String(chatId));
     const exportedWallet =
-      proposal.launchpad === "pumpfun" || proposal.launchpad === "bonk"
+      proposal.launchpad === "pumpfun" || proposal.launchpad === "bonk" || proposal.launchpad === "bags"
         ? exportPumpPortalWallet("group", String(chatId))
         : undefined;
     if (!config.DRY_RUN) {
@@ -1168,9 +1170,7 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
             message: `Dry run only. Would launch ${proposal.name} ($${proposal.symbol}) from group wallet ${wallet.address}.`
           }
         : proposal.launchpad === "bags"
-          ? (() => {
-              throw new Error("Bags launches are disabled for this production release.");
-            })()
+          ? await launchWithBags(proposal, exportedWallet?.secretKey ?? "")
           : proposal.launchpad === "bonk"
             ? await launchWithPumpPortalApiKey(proposal, wallet.apiKey)
             : await launchWithPumpFunSdk(proposal, exportedWallet?.secretKey ?? "", wallet.address);
@@ -1387,9 +1387,13 @@ async function runQueuedLaunch(
   if (mode === "group") {
     const wallet = getPumpPortalApiKey("group", chatId);
     const exportedWallet =
-      proposal.launchpad === "pumpfun" || proposal.launchpad === "bonk" ? exportPumpPortalWallet("group", chatId) : undefined;
+      proposal.launchpad === "pumpfun" || proposal.launchpad === "bonk" || proposal.launchpad === "bags"
+        ? exportPumpPortalWallet("group", chatId)
+        : undefined;
     let result =
-      proposal.launchpad === "bonk"
+      proposal.launchpad === "bags"
+        ? await launchWithBags(proposal, exportedWallet?.secretKey ?? "")
+        : proposal.launchpad === "bonk"
         ? await launchWithPumpPortalApiKey(proposal, wallet.apiKey)
         : await launchWithPumpFunSdk(proposal, exportedWallet?.secretKey ?? "", wallet.address);
     if (!result.dryRun && proposal.launchpad === "bonk" && exportedWallet) {
@@ -1440,7 +1444,10 @@ async function assertGroupLaunchReady(proposal: Proposal, groupId: string, walle
   if (platformFeeSol > 0 && config.PLATFORM_TREASURY_WALLET && !isValidSolanaAddress(config.PLATFORM_TREASURY_WALLET)) {
     problems.push("PLATFORM_TREASURY_WALLET is not a valid Solana wallet address");
   }
-  if (proposal.launchpad === "bags") problems.push("Bags launches are disabled for this production release");
+  if (proposal.launchpad === "bags" && !config.BAGS_API_KEY) problems.push("BAGS_API_KEY is missing");
+  if (proposal.launchpad === "bags" && config.BAGS_MINT_SUFFIX.trim()) {
+    problems.push("Bags vanity suffix is not supported by the current Bags SDK launch flow; set BAGS_MINT_SUFFIX=");
+  }
   if (proposal.launchpad === "pumpfun" && !config.PINATA_JWT) problems.push("PINATA_JWT is missing");
   if (suffix && countAvailableVanityMints(suffix) < 1) {
     problems.push(`no ${proposal.launchpad} vanity mints available for suffix "${suffix}"`);
@@ -1557,7 +1564,7 @@ async function assertApiLaunchReady(proposal: Proposal): Promise<void> {
 
   if (devBuySol > config.MAX_DEV_BUY_SOL) problems.push(`dev buy ${devBuySol} SOL exceeds MAX_DEV_BUY_SOL ${config.MAX_DEV_BUY_SOL} SOL`);
   if (proposal.launchpad === "bags") {
-    problems.push("Bags launches must use Launch Group");
+    problems.push("Bags launches should use Launch Group so the encrypted group wallet signs the launch");
   }
   if (proposal.launchpad === "pumpfun" && !config.PUMPFUN_SIGNER_PRIVATE_KEY) {
     problems.push("PUMPFUN_SIGNER_PRIVATE_KEY is missing");
@@ -1802,7 +1809,7 @@ function parseIdeaCommandShortcut(text: string): Partial<CoinIdeaInput> {
   if (rawLaunchpad === "pumpfun" || rawLaunchpad === "bonk") {
     data.launchpad = rawLaunchpad;
   } else if (rawLaunchpad === "bags") {
-    throw new Error("Bags launches are disabled for now. Use /idea pumpfun or /idea bonk.");
+    data.launchpad = rawLaunchpad;
   }
 
   if (rest.length >= 2) {
@@ -1930,6 +1937,7 @@ function wizardQuestion(step: DraftStep): {
           { text: "🚀 Pump.fun", callback_data: "wizard:launchpad:pumpfun" },
           { text: "🟠 Bonk", callback_data: "wizard:launchpad:bonk" }
         ],
+        [{ text: "🎒 Bags", callback_data: "wizard:launchpad:bags" }],
         [{ text: "❌ Cancel", callback_data: "wizard:cancel" }]
       ]
     };

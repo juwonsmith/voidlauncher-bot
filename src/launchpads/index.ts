@@ -1,5 +1,6 @@
 import { config } from "../config.js";
 import type { LaunchResult, Proposal } from "../types.js";
+import { launchWithBags } from "./bags.js";
 import { launchWithPumpPortal } from "./pumpportal.js";
 
 export async function launchProposal(proposal: Proposal): Promise<LaunchResult> {
@@ -16,7 +17,10 @@ export async function launchProposal(proposal: Proposal): Promise<LaunchResult> 
   }
 
   if (proposal.launchpad === "bags") {
-    throw new Error("Bags launches are disabled for this production release.");
+    if (!config.PUMPFUN_SIGNER_PRIVATE_KEY) {
+      throw new Error("PUMPFUN_SIGNER_PRIVATE_KEY is required for API Bags launches. Prefer Launch Group for Bags.");
+    }
+    return launchWithBags(proposal, config.PUMPFUN_SIGNER_PRIVATE_KEY);
   }
 
   throw new Error(`Unsupported launchpad: ${proposal.launchpad}`);

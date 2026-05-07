@@ -17,6 +17,7 @@ export function helpMessage(): string {
     "<b>Fast start</b>",
     "<code>/idea pumpfun Example Cat ECAT</code>",
     "<code>/idea bonk Example Dog EDOG</code>",
+    "<code>/idea bags Example Bag EBAG</code>",
     "",
     "<b>Power template</b>",
     "<pre>/idea pumpfun",
@@ -31,7 +32,7 @@ export function helpMessage(): string {
     "",
     "&#9989; Ideas go to admin review before launch.",
     "&#128188; Group wallet launches use the group launch wallet.",
-    "&#9888; Bags launches are disabled for now."
+    "&#127890; Bags launches use the group launch wallet."
   ].join("\n");
 }
 
@@ -95,7 +96,7 @@ export function proposalKeyboard(proposal: Proposal): InlineKeyboardButton[][] {
 
   if (proposal.status === "approved") {
     if (proposal.launchpad === "bags") {
-      rows.push([{ text: "Bags Disabled", callback_data: `bags_disabled:${proposal.id}` }]);
+      rows.push([{ text: "Launch Group", callback_data: `launch_group:${proposal.id}` }]);
     } else {
       rows.push([
         { text: "Launch Group", callback_data: `launch_group:${proposal.id}` },
@@ -150,7 +151,7 @@ export function commandHelpMessage(): string {
     "<code>/exportgroupwallet &lt;group_id&gt;</code> - export a specific group wallet",
     "<code>/exportmywallet</code> - export your personal wallet",
     "",
-    "Supported launchpads: <b>Pump.fun</b> and <b>Bonk</b>."
+    "Supported launchpads: <b>Pump.fun</b>, <b>Bonk</b>, and <b>Bags</b>."
   ].join("\n");
 }
 
@@ -232,6 +233,8 @@ function launchLinks(mint: string, launchpad: Proposal["launchpad"]): string[] {
     links.push(`<a href="https://pump.fun/${encodedMint}">Pump.fun</a>`);
   } else if (launchpad === "bonk") {
     links.push(`<a href="https://letsbonk.fun/token/${encodedMint}">Bonk</a>`);
+  } else if (launchpad === "bags") {
+    links.push(`<a href="https://bags.fm/token/${encodedMint}">Bags</a>`);
   }
 
   links.push(`<a href="${escapeAttr(applyMintTemplate(config.AXIOM_LINK_TEMPLATE, mint))}">Axiom</a>`);

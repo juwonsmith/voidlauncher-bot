@@ -123,7 +123,7 @@ Guided flow:
 ```
 
 The bot will ask for launchpad, name, ticker, description, optional links, image/logo, dev buy, then show a preview with submit/cancel buttons.
-The image/logo step is required because launch metadata needs an image.
+The image/logo step is required because launch metadata needs an image. Bags launches are available through Launch Group and require `BAGS_API_KEY`.
 
 Fast image flow:
 
@@ -132,6 +132,14 @@ Fast image flow:
 ```
 
 The bot pre-fills launchpad, name, and ticker, then asks for the missing details. When it asks for an image, upload the image directly in Telegram or paste an image URL.
+
+Bags fast start:
+
+```text
+/idea bags Example Bag EBAG
+```
+
+Current Bags SDK/API launches generate the mint internally, so `BAGS_MINT_SUFFIX` must stay empty until Bags supports caller-provided mints.
 
 Power-user paste format:
 

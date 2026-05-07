@@ -1,10 +1,10 @@
 import { z } from "zod";
 import type { CoinIdeaInput, Launchpad, Proposal } from "./types.js";
 
-const launchpads = new Set<Launchpad>(["pumpfun", "bonk"]);
+const launchpads = new Set<Launchpad>(["pumpfun", "bonk", "bags"]);
 
 export const ideaSchema = z.object({
-  launchpad: z.enum(["pumpfun", "bonk"]),
+  launchpad: z.enum(["pumpfun", "bonk", "bags"]),
   name: z.string().min(2).max(32),
   symbol: z
     .string()
@@ -83,7 +83,7 @@ function normalizeLaunchpad(value: string | undefined): Launchpad {
   if (normalized && launchpads.has(normalized as Launchpad)) {
     return normalized as Launchpad;
   }
-  throw new Error("Use `/idea pumpfun` or `/idea bonk` as the first line. Bags launches are disabled for now.");
+  throw new Error("Use `/idea pumpfun`, `/idea bonk`, or `/idea bags` as the first line.");
 }
 
 export function formatProposal(proposal: Proposal): string {
