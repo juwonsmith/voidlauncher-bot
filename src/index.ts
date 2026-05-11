@@ -965,7 +965,8 @@ bot.action(/^wizard:(.+)$/, async (ctx) => {
 
     if (action === "devbuy_custom") {
       await ctx.answerCbQuery("Send custom amount.");
-      await ctx.reply("Reply with any positive SOL amount for dev buy. Example: <code>0.2</code>", telegramReplyOptions);
+      const prompt = await ctx.reply("Send any positive SOL amount for dev buy. Example: <code>0.2</code>", telegramReplyOptions);
+      draft.promptMessageId = prompt.message_id;
       return;
     }
 
@@ -2088,6 +2089,7 @@ function draftKey(ctx: Context): string | undefined {
 
 function isWizardReply(ctx: Context, draft: Draft): boolean {
   if (ctx.chat?.type === "private") return true;
+  if (draft.step === "devBuy") return true;
   if (!("message" in ctx.update)) return false;
   const message = ctx.update.message as { reply_to_message?: { message_id?: number } };
   const replyTo = message.reply_to_message;
