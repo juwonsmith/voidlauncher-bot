@@ -963,6 +963,12 @@ bot.action(/^wizard:(.+)$/, async (ctx) => {
       return;
     }
 
+    if (action === "devbuy_custom") {
+      await ctx.answerCbQuery("Send custom amount.");
+      await ctx.reply("Reply with any positive SOL amount for dev buy. Example: <code>0.2</code>", telegramReplyOptions);
+      return;
+    }
+
     if (action.startsWith("cashback:")) {
       draft.data.pumpfunCashback = action.endsWith(":on");
       await ctx.answerCbQuery(draft.data.pumpfunCashback ? "Cashback enabled." : "Cashback disabled.");
@@ -1963,7 +1969,7 @@ function wizardQuestion(step: DraftStep): {
       "Reply to this message with the Telegram/community link, use this group, tap Skip, or send <code>/skip</code>.",
     twitter: "Reply to this message with the Twitter/X link, tap Skip, or send <code>/skip</code>.",
     image: "Reply with an image URL or upload the image as a reply. Image is required for launch metadata.",
-    devBuy: "Choose the dev buy amount, send a custom SOL amount, or use default.",
+    devBuy: "Choose 0.01 SOL, 0.05 SOL, or tap Custom and send any positive SOL amount.",
     cashback: "Pump.fun cashback uses the V2 create flow. Enable it only if you want cashback on this launch.",
     feeShares:
       "Choose Pump.fun creator-fee sharing. This can lock reward distribution once configured.",
@@ -1988,7 +1994,7 @@ function wizardQuestion(step: DraftStep): {
       [
         { text: "0.01 SOL", callback_data: "wizard:devbuy:0.01" },
         { text: "0.05 SOL", callback_data: "wizard:devbuy:0.05" },
-        { text: "Default", callback_data: "wizard:skip:devBuy" }
+        { text: "Custom", callback_data: "wizard:devbuy_custom" }
       ],
       [{ text: "❌ Cancel", callback_data: "wizard:cancel" }]
     ],
