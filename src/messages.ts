@@ -18,6 +18,7 @@ export function helpMessage(): string {
     "<code>/idea pumpfun Example Cat ECAT</code>",
     "<code>/idea bonk Example Dog EDOG</code>",
     "<code>/idea bags Example Bag EBAG</code>",
+    "<code>/idea robinhood Example Hood EHOOD</code>",
     "",
     "<b>Power template</b>",
     "<pre>/idea pumpfun",
@@ -32,7 +33,8 @@ export function helpMessage(): string {
     "",
     "&#9989; Ideas go to admin review before launch.",
     "&#128188; Group wallet launches use the group launch wallet.",
-    "&#127890; Bags launches use the group launch wallet."
+    "&#127890; Bags launches use the group launch wallet.",
+    "&#129001; Robinhood Chain launches use the Robinhood ETH wallet."
   ].join("\n");
 }
 
@@ -41,6 +43,10 @@ export function helpKeyboard(): InlineKeyboardButton[][] {
     [
       { text: "Pump.fun", url: "https://pump.fun" },
       { text: "Bonk", url: "https://letsbonk.fun" }
+    ],
+    [
+      { text: "Bags", url: "https://bags.fm" },
+      { text: "Robinhood Chain", url: "https://docs.robinhood.com/chain/" }
     ]
   ];
 }
@@ -57,7 +63,9 @@ export function proposalMessage(proposal: Proposal, heading = "New Coin Idea"): 
     `&#128313; <b>${escapeHtml(proposal.name)}</b> | <code>$${escapeHtml(proposal.symbol)}</code>`,
     `&#128640; Launchpad: <b>${launchpadName(proposal.launchpad)}</b>`,
     `&#128205; Status: <b>${statusLabel(proposal.status)}</b>`,
-    `&#128176; Dev Buy: <b>${proposal.devBuySol ?? "default"} SOL</b>`,
+    proposal.launchpad === "robinhood"
+      ? `&#128176; Initial Buy: <b>${proposal.devBuyEth ?? "default"} ETH</b>`
+      : `&#128176; Dev Buy: <b>${proposal.devBuySol ?? "default"} SOL</b>`,
     proposal.launchpad === "pumpfun"
       ? `&#127873; Cashback: <b>${proposal.pumpfunCashback ? "Enabled" : "Off"}</b>`
       : undefined,
@@ -97,6 +105,11 @@ export function proposalKeyboard(proposal: Proposal): InlineKeyboardButton[][] {
   if (proposal.status === "approved") {
     if (proposal.launchpad === "bags") {
       rows.push([{ text: "Launch Group", callback_data: `launch_group:${proposal.id}` }]);
+    } else if (proposal.launchpad === "robinhood") {
+      rows.push([
+        { text: "Launch Group", callback_data: `launch_group:${proposal.id}` },
+        { text: "Launch Me", callback_data: `launch_me:${proposal.id}` }
+      ]);
     } else {
       rows.push([
         { text: "Launch Group", callback_data: `launch_group:${proposal.id}` },
@@ -144,6 +157,10 @@ export function commandHelpMessage(): string {
     "<code>/groupbalance</code> - check group wallet balance",
     "<code>/mywallet</code> - create/show your personal launch wallet",
     "<code>/mybalance</code> - check your personal wallet balance",
+    "<code>/rhgroupwallet</code> - create/show Robinhood Chain group wallet",
+    "<code>/rhgroupbalance</code> - check Robinhood Chain group wallet balance",
+    "<code>/rhmywallet</code> - create/show your Robinhood Chain personal wallet",
+    "<code>/rhmybalance</code> - check your Robinhood Chain personal wallet balance",
     "<code>/txcheck &lt;signature&gt; [ca]</code> - inspect a launch transaction",
     "",
     "<b>Admin DM Only</b>",
@@ -151,7 +168,7 @@ export function commandHelpMessage(): string {
     "<code>/exportgroupwallet &lt;group_id&gt;</code> - export a specific group wallet",
     "<code>/exportmywallet</code> - export your personal wallet",
     "",
-    "Supported launchpads: <b>Pump.fun</b>, <b>Bonk</b>, and <b>Bags</b>."
+    "Supported launchpads: <b>Pump.fun</b>, <b>Bonk</b>, <b>Bags</b>, and <b>Robinhood Chain</b>."
   ].join("\n");
 }
 
@@ -165,7 +182,11 @@ export function launchMessage(result: LaunchResult): string {
     result.platformFeeUrl ? `&#128188; Platform Fee: <a href="${escapeAttr(result.platformFeeUrl)}">Paid</a>` : undefined,
     result.platformFeeError ? `&#9888; Platform Fee: ${escapeHtml(result.platformFeeError)}` : undefined,
     result.mint ? `&#129689; CA: <code>${escapeHtml(result.mint)}</code>` : undefined,
-    result.explorerUrl ? `&#128269; Solscan: <a href="${escapeAttr(result.explorerUrl)}">Solscan</a>` : undefined,
+    result.explorerUrl
+      ? result.launchpad === "robinhood"
+        ? `&#128269; Blockscout: <a href="${escapeAttr(result.explorerUrl)}">Blockscout</a>`
+        : `&#128269; Solscan: <a href="${escapeAttr(result.explorerUrl)}">Solscan</a>`
+      : undefined,
     links.length > 0 ? `&#128279; Links: ${links.join(" | ")}` : undefined
   ]
     .filter(Boolean)
@@ -175,7 +196,7 @@ export function launchMessage(result: LaunchResult): string {
 export function launchKeyboard(result: LaunchResult): InlineKeyboardButton[][] | undefined {
   if (!result.mint) return undefined;
   const rows: InlineKeyboardButton[][] = [[copyButton("Copy CA", result.mint)]];
-  if (result.explorerUrl) rows[0].push({ text: "Solscan", url: result.explorerUrl });
+  if (result.explorerUrl) rows[0].push({ text: result.launchpad === "robinhood" ? "Blockscout" : "Solscan", url: result.explorerUrl });
   return rows;
 }
 
@@ -235,6 +256,10 @@ function launchLinks(mint: string, launchpad: Proposal["launchpad"]): string[] {
     links.push(`<a href="https://letsbonk.fun/token/${encodedMint}">Bonk</a>`);
   } else if (launchpad === "bags") {
     links.push(`<a href="https://bags.fm/token/${encodedMint}">Bags</a>`);
+  } else if (launchpad === "robinhood") {
+    links.push(`<a href="https://bags.fm/token/${encodedMint}">Bags</a>`);
+    links.push(`<a href="https://robinhoodchain.blockscout.com/token/${encodedMint}">Token</a>`);
+    return links;
   }
 
   links.push(`<a href="${escapeAttr(applyMintTemplate(config.AXIOM_LINK_TEMPLATE, mint))}">Axiom</a>`);
@@ -266,6 +291,7 @@ export function copyButton(text: string, value: string): InlineKeyboardButton {
 function launchpadName(launchpad: Proposal["launchpad"]): string {
   if (launchpad === "bonk") return "Bonk";
   if (launchpad === "bags") return "BagsApp";
+  if (launchpad === "robinhood") return "Robinhood Chain";
   return "Pump.fun";
 }
 

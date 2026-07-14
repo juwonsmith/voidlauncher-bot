@@ -1,4 +1,3 @@
-import { getBuyTokenAmountFromSolAmount, OnlinePumpSdk, PumpSdk } from "@pump-fun/pump-sdk";
 import {
   Connection,
   Keypair,
@@ -16,6 +15,22 @@ import { consumeVanityMint, markVanityMintUsed, releaseVanityMint } from "../db.
 import { imageValidationSummary, validateImageFile } from "../imageValidation.js";
 import type { LaunchResult, Proposal } from "../types.js";
 import { getSolBalance } from "../wallets.js";
+
+type PumpSdkPackage = {
+  getBuyTokenAmountFromSolAmount: (args: {
+    global: unknown;
+    feeConfig: unknown;
+    mintSupply: unknown;
+    bondingCurve: unknown;
+    amount: BN;
+  }) => BN;
+  OnlinePumpSdk: new (connection: Connection) => { fetchGlobal: () => Promise<unknown> };
+  PumpSdk: new () => {
+    createV2AndBuyInstructions: (args: Record<string, unknown>) => Promise<unknown[]>;
+    createAndBuyInstructions: (args: Record<string, unknown>) => Promise<unknown[]>;
+    createSharingConfigWithSocialRecipients: (args: Record<string, unknown>) => Promise<unknown[]>;
+  };
+};
 
 interface PinataResponse {
   data?: {
@@ -51,6 +66,11 @@ export interface PlatformFeeResult {
 class UnknownConfirmationError extends Error {}
 class NonRetryableLaunchError extends Error {}
 class UnlandedLaunchError extends Error {}
+
+async function loadPumpSdk(): Promise<PumpSdkPackage> {
+  const modulePath = "../../node_modules/@pump-fun/pump-sdk/dist/esm/index.js";
+  return (await import(modulePath)) as PumpSdkPackage;
+}
 
 export async function launchWithPumpPortal(proposal: Proposal): Promise<LaunchResult> {
   if (proposal.launchpad === "pumpfun") {
@@ -442,6 +462,7 @@ async function sendPumpFunSdkCreateRequest(
     throw new Error(`Prepared mint address mismatch: ${mintKeypair.address} != ${mintAddress}.`);
   }
 
+  const { getBuyTokenAmountFromSolAmount, OnlinePumpSdk, PumpSdk } = await loadPumpSdk();
   const connection = new Connection(config.SOLANA_RPC_URL, "confirmed");
   const onlineSdk = new OnlinePumpSdk(connection);
   const sdk = new PumpSdk();
@@ -482,7 +503,7 @@ async function sendPumpFunSdkCreateRequest(
         amount: tokenAmount
       });
 
-  const transaction = new Transaction().add(...createInstructions);
+  const transaction = new Transaction().add(...(createInstructions as Parameters<Transaction["add"]>));
   transaction.feePayer = signerKeypair.publicKey;
   const latestBlockhash = await connection.getLatestBlockhash("confirmed");
   transaction.recentBlockhash = latestBlockhash.blockhash;
@@ -528,6 +549,7 @@ async function configurePumpFunFeeSharingIfEnabled(
   const shareholders = parsePumpFunFeeShares(proposal, signerKeypair.publicKey);
   if (shareholders.length === 0) return {};
 
+  const { PumpSdk } = await loadPumpSdk();
   const connection = new Connection(config.SOLANA_RPC_URL, "confirmed");
   const sdk = new PumpSdk();
   const instructions = await sdk.createSharingConfigWithSocialRecipients({
@@ -540,7 +562,7 @@ async function configurePumpFunFeeSharingIfEnabled(
     }))
   });
 
-  const transaction = new Transaction().add(...instructions);
+  const transaction = new Transaction().add(...(instructions as Parameters<Transaction["add"]>));
   transaction.feePayer = signerKeypair.publicKey;
   const latestBlockhash = await connection.getLatestBlockhash("confirmed");
   transaction.recentBlockhash = latestBlockhash.blockhash;

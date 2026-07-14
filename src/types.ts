@@ -1,4 +1,4 @@
-export type Launchpad = "pumpfun" | "bonk" | "bags";
+export type Launchpad = "pumpfun" | "bonk" | "bags" | "robinhood";
 export type ProposalStatus = "pending" | "approved" | "rejected" | "launched";
 
 export interface CoinIdeaInput {
@@ -11,6 +11,7 @@ export interface CoinIdeaInput {
   twitter?: string;
   image?: string;
   devBuySol?: number;
+  devBuyEth?: number;
   pumpfunCashback?: boolean;
   pumpfunFeeShares?: string;
 }
@@ -40,5 +41,7 @@ export interface LaunchResult {
   platformFeeSignature?: string;
   platformFeeUrl?: string;
   platformFeeError?: string;
+  curve?: string;
+  feeShare?: string;
   message: string;
 }

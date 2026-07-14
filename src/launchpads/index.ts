@@ -2,6 +2,7 @@ import { config } from "../config.js";
 import type { LaunchResult, Proposal } from "../types.js";
 import { launchWithBags } from "./bags.js";
 import { launchWithPumpPortal } from "./pumpportal.js";
+import { launchWithRobinhoodBags } from "./robinhood.js";
 
 export async function launchProposal(proposal: Proposal): Promise<LaunchResult> {
   if (config.DRY_RUN) {
@@ -23,5 +24,11 @@ export async function launchProposal(proposal: Proposal): Promise<LaunchResult> 
     return launchWithBags(proposal, config.PUMPFUN_SIGNER_PRIVATE_KEY);
   }
 
+  if (proposal.launchpad === "robinhood") {
+    throw new Error("Robinhood Chain launches use group or personal Robinhood wallets. Use Launch Group or Launch Me.");
+  }
+
   throw new Error(`Unsupported launchpad: ${proposal.launchpad}`);
 }
+
+export { launchWithRobinhoodBags };

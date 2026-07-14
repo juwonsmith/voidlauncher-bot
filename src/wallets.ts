@@ -3,20 +3,36 @@ import fs from "node:fs";
 import path from "node:path";
 import bs58 from "bs58";
 import nacl from "tweetnacl";
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { config } from "./config.js";
 import { createWalletRecord, getWallet, type StoredWallet } from "./db.js";
 
-export type WalletScope = "group" | "user" | "group_portal";
+export type WalletScope = "group" | "user" | "group_portal" | "group_evm" | "user_evm";
 
 export interface WalletView {
   scope: WalletScope;
   scopeId: string;
   address: string;
-  provider: "local" | "pumpportal";
+  provider: "local" | "pumpportal" | "evm";
   hasApiKey: boolean;
   balanceSol?: number;
+  balanceEth?: number;
   balanceError?: string;
   created: boolean;
+}
+
+export async function getOrCreateRobinhoodWallet(scope: "group" | "user", scopeId: string): Promise<WalletView> {
+  const storageScope = robinhoodStorageScope(scope);
+  const existing = getWallet(storageScope, scopeId);
+  const wallet = existing ?? createEncryptedEvmWallet(storageScope, scopeId);
+  return {
+    scope: storageScope,
+    scopeId,
+    address: wallet.address,
+    provider: wallet.provider,
+    hasApiKey: false,
+    created: !existing
+  };
 }
 
 export async function getOrCreateWallet(scope: WalletScope, scopeId: string): Promise<WalletView> {
@@ -153,6 +169,20 @@ export function getWalletSecretBase58(scope: WalletScope, scopeId: string): { ad
   return exportWalletSecretBase58(scope, scopeId);
 }
 
+export function getRobinhoodWalletSecret(scope: "group" | "user", scopeId: string): {
+  address: `0x${string}`;
+  privateKey: `0x${string}`;
+} {
+  const wallet = getWallet(robinhoodStorageScope(scope), scopeId);
+  if (!wallet) throw new Error("Robinhood wallet not found. Create it with /rhgroupwallet or /rhmywallet.");
+  if (wallet.provider !== "evm") throw new Error("Stored wallet is not a Robinhood/EVM wallet.");
+
+  return {
+    address: wallet.address as `0x${string}`,
+    privateKey: Buffer.from(decryptWalletSecret(wallet)).toString("utf8") as `0x${string}`
+  };
+}
+
 export async function getSolBalance(address: string): Promise<number> {
   let lastError: unknown;
 
@@ -166,6 +196,34 @@ export async function getSolBalance(address: string): Promise<number> {
   }
 
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+export async function getEthBalance(address: string): Promise<number> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), config.BALANCE_CHECK_TIMEOUT_MS);
+  const response = await fetch(config.ROBINHOOD_RPC_URL, {
+    method: "POST",
+    signal: controller.signal,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "eth_getBalance",
+      params: [address, "latest"]
+    })
+  }).finally(() => clearTimeout(timeout));
+
+  const body = (await response.json().catch(() => ({}))) as {
+    result?: string;
+    error?: { message?: string };
+  };
+
+  if (!response.ok || body.error) {
+    throw new Error(body.error?.message ?? `Robinhood RPC balance request failed: ${response.status} ${response.statusText}`);
+  }
+  if (!body.result) throw new Error("Robinhood RPC balance response did not include a value.");
+
+  return Number(BigInt(body.result)) / 1e18;
 }
 
 async function fetchSolBalance(address: string): Promise<number> {
@@ -216,6 +274,12 @@ function createEncryptedWallet(scope: WalletScope, scopeId: string): StoredWalle
   const address = bs58.encode(keypair.publicKey);
   const secretKeyBase58 = bs58.encode(keypair.secretKey);
   return createWalletRecord(scope, scopeId, address, encryptSecret(secretKeyBase58));
+}
+
+function createEncryptedEvmWallet(scope: WalletScope, scopeId: string): StoredWallet {
+  const privateKey = generatePrivateKey();
+  const account = privateKeyToAccount(privateKey);
+  return createWalletRecord(scope, scopeId, account.address, encryptSecret(privateKey), "evm");
 }
 
 async function createPumpPortalWallet(scope: WalletScope, scopeId: string): Promise<StoredWallet> {
@@ -269,6 +333,10 @@ function stringField(body: Record<string, unknown>, names: string[]): string | u
 
 function pumpPortalStorageScope(scope: WalletScope): WalletScope {
   return scope === "group" ? "group_portal" : scope;
+}
+
+function robinhoodStorageScope(scope: "group" | "user"): WalletScope {
+  return scope === "group" ? "group_evm" : "user_evm";
 }
 
 function walletEncryptionKey(): Buffer {

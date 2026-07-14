@@ -29,6 +29,7 @@ import {
 } from "./db.js";
 import { launchProposal } from "./launchpads/index.js";
 import { launchWithBags } from "./launchpads/bags.js";
+import { launchWithRobinhoodBags } from "./launchpads/robinhood.js";
 import {
   launchWithPumpFunSdk,
   launchWithPumpPortalApiKey,
@@ -62,7 +63,10 @@ import {
   exportPumpPortalWallet,
   getOrCreateWallet,
   getOrCreatePumpPortalWallet,
+  getOrCreateRobinhoodWallet,
+  getEthBalance,
   getPumpPortalApiKey,
+  getRobinhoodWalletSecret,
   getSolBalance,
   getWalletSecretBase58,
   getWalletSummary,
@@ -203,6 +207,35 @@ bot.command("groupbalance", async (ctx) => {
   }
 });
 
+bot.command("rhgroupwallet", async (ctx) => {
+  if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup") {
+    return ctx.reply("Use this command inside a Telegram group.");
+  }
+  if (!(await isBotAdmin(ctx))) return ctx.reply("Admin command only.");
+
+  try {
+    const wallet = await withEthBalance(await getOrCreateRobinhoodWallet("group", String(ctx.chat.id)));
+    await replyWallet(ctx, "Robinhood Group Wallet", wallet);
+  } catch (error) {
+    return ctx.reply(formatError(error), telegramReplyOptions);
+  }
+});
+
+bot.command("rhgroupbalance", async (ctx) => {
+  if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup") {
+    return ctx.reply("Use this command inside a Telegram group.");
+  }
+
+  const wallet = getWalletSummary("group_evm", String(ctx.chat.id));
+  if (!wallet) return ctx.reply("No Robinhood group wallet yet. An admin can create one with /rhgroupwallet.");
+
+  try {
+    await replyWallet(ctx, "Robinhood Group Wallet", await withEthBalance(wallet));
+  } catch (error) {
+    await replyWallet(ctx, "Robinhood Group Wallet", withBalanceError(wallet, error));
+  }
+});
+
 bot.command("mywallet", async (ctx) => {
   if (!ctx.from) return ctx.reply("I could not identify you.");
 
@@ -224,6 +257,30 @@ bot.command("mybalance", async (ctx) => {
     await replyWallet(ctx, "Personal Launch Wallet", await withBalance(wallet));
   } catch (error) {
     await replyWallet(ctx, "Personal Launch Wallet", withBalanceError(wallet, error));
+  }
+});
+
+bot.command("rhmywallet", async (ctx) => {
+  if (!ctx.from) return ctx.reply("I could not identify you.");
+
+  try {
+    const wallet = await withEthBalance(await getOrCreateRobinhoodWallet("user", String(ctx.from.id)));
+    await replyWallet(ctx, "Robinhood Personal Wallet", wallet);
+  } catch (error) {
+    return ctx.reply(formatError(error), telegramReplyOptions);
+  }
+});
+
+bot.command("rhmybalance", async (ctx) => {
+  if (!ctx.from) return ctx.reply("I could not identify you.");
+
+  const wallet = getWalletSummary("user_evm", String(ctx.from.id));
+  if (!wallet) return ctx.reply("No Robinhood personal wallet yet. Create one with /rhmywallet.");
+
+  try {
+    await replyWallet(ctx, "Robinhood Personal Wallet", await withEthBalance(wallet));
+  } catch (error) {
+    await replyWallet(ctx, "Robinhood Personal Wallet", withBalanceError(wallet, error));
   }
 });
 
@@ -634,6 +691,10 @@ bot.command("launchcheck", async (ctx) => {
     ctx.chat?.type === "group" || ctx.chat?.type === "supergroup"
       ? await getWalletView("group_portal", String(ctx.chat.id))
       : undefined;
+  const robinhoodGroupWallet =
+    ctx.chat?.type === "group" || ctx.chat?.type === "supergroup"
+      ? getWalletSummary("group_evm", String(ctx.chat.id))
+      : undefined;
 
   const lines = [
     "<b>Launch Readiness</b>",
@@ -643,11 +704,17 @@ bot.command("launchcheck", async (ctx) => {
     `PumpPortal API key (Bonk): <b>${config.PUMPPORTAL_API_KEY ? "SET" : "MISSING"}</b>`,
     `Bags API key: <b>${config.BAGS_API_KEY ? "SET" : "MISSING"}</b>`,
     `Pinata JWT: <b>${config.PINATA_JWT ? "SET" : "MISSING"}</b>`,
+    `Robinhood RPC: <b>${config.ROBINHOOD_RPC_URL ? "SET" : "MISSING"}</b>`,
     `Default dev buy: <b>${config.DEFAULT_DEV_BUY_SOL} SOL</b>`,
+    `Default Robinhood initial buy: <b>${config.DEFAULT_DEV_BUY_ETH} ETH</b>`,
     `Slippage: <b>${config.DEFAULT_SLIPPAGE_PERCENT}%</b>`,
     `Priority fee: <b>${config.DEFAULT_PRIORITY_FEE_SOL} SOL</b>`,
     `Platform fee: <b>${config.PLATFORM_FEE_SOL} SOL</b>`,
     `Treasury wallet: <b>${config.PLATFORM_FEE_SOL > 0 ? (config.PLATFORM_TREASURY_WALLET ? "SET" : "MISSING") : "off"}</b>`,
+    `Robinhood platform fee: <b>${config.ROBINHOOD_PLATFORM_FEE_ETH} ETH</b>`,
+    `Robinhood treasury wallet: <b>${
+      config.ROBINHOOD_PLATFORM_FEE_ETH > 0 ? (config.ROBINHOOD_PLATFORM_TREASURY_WALLET ? "SET" : "MISSING") : "off"
+    }</b>`,
     `Max dev buy: <b>${config.MAX_DEV_BUY_SOL > 0 ? `${config.MAX_DEV_BUY_SOL} SOL` : "unlimited"}</b>`,
     `Group daily launch limit: <b>${config.GROUP_DAILY_LAUNCH_LIMIT > 0 ? config.GROUP_DAILY_LAUNCH_LIMIT : "unlimited"}</b>`,
     `User daily launch limit: <b>${config.USER_DAILY_LAUNCH_LIMIT > 0 ? config.USER_DAILY_LAUNCH_LIMIT : "unlimited"}</b>`,
@@ -678,6 +745,11 @@ bot.command("launchcheck", async (ctx) => {
         ? `Group wallet balance: <b>unavailable</b>`
         : undefined
       : `Group wallet balance: <b>${groupWallet.balanceSol.toFixed(6)} SOL</b>`,
+    ctx.chat?.type === "group" || ctx.chat?.type === "supergroup"
+      ? `<b>Robinhood Group Wallet</b>: ${
+          robinhoodGroupWallet ? `<code>${escapeHtml(robinhoodGroupWallet.address)}</code>` : "MISSING"
+        }`
+      : undefined,
     "",
     config.DRY_RUN
       ? "Set <code>DRY_RUN=false</code> only after your API key/wallet is funded and tested."
@@ -947,7 +1019,7 @@ bot.action(/^wizard:(.+)$/, async (ctx) => {
   try {
     if (action.startsWith("launchpad:")) {
       const launchpad = action.split(":")[1];
-      if (launchpad !== "pumpfun" && launchpad !== "bonk" && launchpad !== "bags") {
+      if (launchpad !== "pumpfun" && launchpad !== "bonk" && launchpad !== "bags" && launchpad !== "robinhood") {
         throw new Error("Invalid launchpad.");
       }
       draft.data.launchpad = launchpad;
@@ -957,7 +1029,9 @@ bot.action(/^wizard:(.+)$/, async (ctx) => {
     }
 
     if (action.startsWith("devbuy:")) {
-      draft.data.devBuySol = Number(action.split(":")[1]);
+      const amount = Number(action.split(":")[1]);
+      if (draft.data.launchpad === "robinhood") draft.data.devBuyEth = amount;
+      else draft.data.devBuySol = amount;
       await ctx.answerCbQuery("Dev buy set.");
       await advanceWizard(ctx, draft, true);
       return;
@@ -965,7 +1039,8 @@ bot.action(/^wizard:(.+)$/, async (ctx) => {
 
     if (action === "devbuy_custom") {
       await ctx.answerCbQuery("Send custom amount.");
-      const prompt = await ctx.reply("Send any positive SOL amount for dev buy. Example: <code>0.2</code>", telegramReplyOptions);
+      const unit = draft.data.launchpad === "robinhood" ? "ETH" : "SOL";
+      const prompt = await ctx.reply(`Send any positive ${unit} amount for initial buy. Example: <code>0.2</code>`, telegramReplyOptions);
       draft.promptMessageId = prompt.message_id;
       return;
     }
@@ -1096,6 +1171,41 @@ async function runApiLaunch(ctx: Context, id: number): Promise<void> {
 async function sendLaunchConfirmation(ctx: Context, mode: LaunchMode, id: number): Promise<void> {
   const proposal = getProposal(id);
   if (!proposal) return void (await ctx.reply(`Proposal #${id} not found.`));
+  if (proposal.launchpad === "robinhood") {
+    const devBuyEth = proposal.devBuyEth ?? config.DEFAULT_DEV_BUY_ETH;
+    const platformFeeEth = config.ROBINHOOD_PLATFORM_FEE_ETH > 0 ? config.ROBINHOOD_PLATFORM_FEE_ETH : 0;
+    const minimumTotal = devBuyEth + platformFeeEth + 0.025;
+
+    await ctx.reply(
+      [
+        `<b>Confirm Launch Spend #${proposal.id}</b>`,
+        "",
+        `<b>${escapeHtml(proposal.name)}</b> | <code>$${escapeHtml(proposal.symbol)}</code>`,
+        `Mode: <b>${mode === "api" ? "API" : mode === "group" ? "Group Wallet" : "Personal Wallet"}</b>`,
+        "Launchpad: <b>Robinhood Chain / Bags</b>",
+        "",
+        `Initial buy: <b>${devBuyEth} ETH</b>`,
+        "Bags creation fee: <b>read live before launch</b>",
+        platformFeeEth > 0 ? `Platform fee: <b>${platformFeeEth} ETH</b>` : `Platform fee: <b>off</b>`,
+        `Suggested wallet minimum: <b>${minimumTotal.toFixed(6)} ETH</b>`,
+        "",
+        "Only continue if the metadata, image, wallet, and spend are correct."
+      ].join("\n"),
+      {
+        ...telegramReplyOptions,
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "Confirm Launch", callback_data: `confirm_launch:${mode}:${id}` },
+              { text: "Cancel", callback_data: `cancel_launch:${id}` }
+            ]
+          ]
+        }
+      }
+    );
+    return;
+  }
+
   const devBuySol = proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL;
   const priorityFeeSol = priorityFeeForLaunchpad(proposal.launchpad);
   const platformFeeSol = config.PLATFORM_FEE_SOL > 0 ? config.PLATFORM_FEE_SOL : 0;
@@ -1144,13 +1254,15 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
   }
 
   await withLaunchLock(ctx, `proposal:${id}`, async () => {
-    const wallet = getPumpPortalApiKey("group", String(chatId));
+    const robinhoodWallet =
+      proposal.launchpad === "robinhood" ? await getOrCreateRobinhoodWallet("group", String(chatId)) : undefined;
+    const wallet = proposal.launchpad === "robinhood" ? undefined : getPumpPortalApiKey("group", String(chatId));
     const exportedWallet =
       proposal.launchpad === "pumpfun" || proposal.launchpad === "bonk" || proposal.launchpad === "bags"
         ? exportPumpPortalWallet("group", String(chatId))
         : undefined;
     if (!config.DRY_RUN) {
-      await assertGroupLaunchReady(proposal, String(chatId), wallet.address);
+      await assertGroupLaunchReady(proposal, String(chatId), robinhoodWallet?.address ?? wallet!.address);
     }
 
     const progressMessage = await ctx.reply(
@@ -1164,7 +1276,7 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
       proposalId: proposal.id,
       launchpad: proposal.launchpad,
       mode: "group",
-      payerAddress: wallet.address,
+      payerAddress: robinhoodWallet?.address ?? wallet?.address,
       chatId: String(chatId),
       actorId: ctx.from?.id
     });
@@ -1174,19 +1286,27 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
         ? {
             launchpad: proposal.launchpad,
             dryRun: true,
-            message: `Dry run only. Would launch ${proposal.name} ($${proposal.symbol}) from group wallet ${wallet.address}.`
+            message: `Dry run only. Would launch ${proposal.name} ($${proposal.symbol}) from group wallet ${
+              robinhoodWallet?.address ?? wallet?.address
+            }.`
           }
+        : proposal.launchpad === "robinhood"
+          ? await launchWithRobinhoodBags(
+              proposal,
+              getRobinhoodWalletSecret("group", String(chatId)).privateKey,
+              robinhoodWallet?.address
+            )
         : proposal.launchpad === "bags"
           ? await launchWithBags(proposal, exportedWallet?.secretKey ?? "")
           : proposal.launchpad === "bonk"
-            ? await launchWithPumpPortalApiKey(proposal, wallet.apiKey)
-            : await launchWithPumpFunSdk(proposal, exportedWallet?.secretKey ?? "", wallet.address);
+            ? await launchWithPumpPortalApiKey(proposal, wallet!.apiKey)
+            : await launchWithPumpFunSdk(proposal, exportedWallet?.secretKey ?? "", wallet!.address);
     } catch (error) {
       finishLaunchAttempt(attemptId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
       throw error;
     }
     if (!result.dryRun && proposal.launchpad === "bonk" && exportedWallet) {
-      const platformFee: PlatformFeeResult = await sendPlatformFeeIfEnabled(exportedWallet.secretKey, wallet.address).catch(
+      const platformFee: PlatformFeeResult = await sendPlatformFeeIfEnabled(exportedWallet.secretKey, wallet!.address).catch(
         (error): PlatformFeeResult => ({
           error: error instanceof Error ? error.message : String(error)
         })
@@ -1200,7 +1320,7 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
     }
     if (!result.dryRun) markLaunched(id, result.signature);
     finishLaunchAttempt(attemptId, { status: "success", signature: result.signature, mint: result.mint });
-    audit(ctx, "launch_group", id, { signature: result.signature, mint: result.mint, payerAddress: wallet.address });
+    audit(ctx, "launch_group", id, { signature: result.signature, mint: result.mint, payerAddress: robinhoodWallet?.address ?? wallet?.address });
     await safeDeleteMessage(ctx, progressMessage.message_id, "group launch progress");
     await replyLaunchResult(ctx, result);
   });
@@ -1220,12 +1340,15 @@ async function runPersonalLaunch(ctx: Context, id: number): Promise<void> {
   if (proposal.createdBy !== ctx.from.id && !(await isBotAdmin(ctx))) {
     return void (await ctx.reply("You can only personal-launch your own proposal."));
   }
-  if (proposal.launchpad !== "pumpfun") {
-    return void (await ctx.reply("Personal launch currently supports Pump.fun only. Use group/API launch for Bonk."));
+  if (proposal.launchpad !== "pumpfun" && proposal.launchpad !== "robinhood") {
+    return void (await ctx.reply("Personal launch currently supports Pump.fun and Robinhood Chain only. Use group/API launch for Bonk."));
   }
 
   await withLaunchLock(ctx, `personal:${ctx.from.id}:${id}`, async () => {
-    const wallet = await getOrCreateWallet("user", String(ctx.from!.id));
+    const wallet =
+      proposal.launchpad === "robinhood"
+        ? await getOrCreateRobinhoodWallet("user", String(ctx.from!.id))
+        : await getOrCreateWallet("user", String(ctx.from!.id));
     if (!config.DRY_RUN) {
       await assertPersonalLaunchReady(proposal, wallet.address);
     }
@@ -1253,7 +1376,13 @@ async function runPersonalLaunch(ctx: Context, id: number): Promise<void> {
             dryRun: true,
             message: `Dry run only. Would launch ${proposal.name} ($${proposal.symbol}) from personal wallet ${wallet.address}.`
           }
-        : await launchWithPumpFunSdk(proposal, exportWalletSecretBase58("user", String(ctx.from!.id)).secretKey, wallet.address);
+        : proposal.launchpad === "robinhood"
+          ? await launchWithRobinhoodBags(
+              proposal,
+              getRobinhoodWalletSecret("user", String(ctx.from!.id)).privateKey,
+              wallet.address
+            )
+          : await launchWithPumpFunSdk(proposal, exportWalletSecretBase58("user", String(ctx.from!.id)).secretKey, wallet.address);
       finishLaunchAttempt(attemptId, { status: "success", signature: result.signature, mint: result.mint });
     } catch (error) {
       finishLaunchAttempt(attemptId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
@@ -1303,12 +1432,18 @@ async function executeLaunchJob(job: {
 
     let payerAddress: string | undefined;
     if (job.mode === "group") {
-      const wallet = getPumpPortalApiKey("group", job.chatId);
+      const wallet =
+        proposal.launchpad === "robinhood"
+          ? await getOrCreateRobinhoodWallet("group", job.chatId)
+          : getPumpPortalApiKey("group", job.chatId);
       payerAddress = wallet.address;
       if (!config.DRY_RUN) await assertGroupLaunchReady(proposal, job.chatId, wallet.address);
     } else if (job.mode === "personal") {
       if (!job.actorId) throw new Error("Personal launch job is missing actor id.");
-      const wallet = await getOrCreateWallet("user", String(job.actorId));
+      const wallet =
+        proposal.launchpad === "robinhood"
+          ? await getOrCreateRobinhoodWallet("user", String(job.actorId))
+          : await getOrCreateWallet("user", String(job.actorId));
       payerAddress = wallet.address;
       if (!config.DRY_RUN) await assertPersonalLaunchReady(proposal, wallet.address);
     } else if (!config.DRY_RUN) {
@@ -1392,19 +1527,22 @@ async function runQueuedLaunch(
   if (mode === "api") return launchProposal(proposal);
 
   if (mode === "group") {
-    const wallet = getPumpPortalApiKey("group", chatId);
+    const robinhoodWallet = proposal.launchpad === "robinhood" ? await getOrCreateRobinhoodWallet("group", chatId) : undefined;
+    const wallet = proposal.launchpad === "robinhood" ? undefined : getPumpPortalApiKey("group", chatId);
     const exportedWallet =
       proposal.launchpad === "pumpfun" || proposal.launchpad === "bonk" || proposal.launchpad === "bags"
         ? exportPumpPortalWallet("group", chatId)
         : undefined;
     let result =
-      proposal.launchpad === "bags"
+      proposal.launchpad === "robinhood"
+        ? await launchWithRobinhoodBags(proposal, getRobinhoodWalletSecret("group", chatId).privateKey, robinhoodWallet?.address)
+        : proposal.launchpad === "bags"
         ? await launchWithBags(proposal, exportedWallet?.secretKey ?? "")
         : proposal.launchpad === "bonk"
-        ? await launchWithPumpPortalApiKey(proposal, wallet.apiKey)
-        : await launchWithPumpFunSdk(proposal, exportedWallet?.secretKey ?? "", wallet.address);
+        ? await launchWithPumpPortalApiKey(proposal, wallet!.apiKey)
+        : await launchWithPumpFunSdk(proposal, exportedWallet?.secretKey ?? "", wallet!.address);
     if (!result.dryRun && proposal.launchpad === "bonk" && exportedWallet) {
-      const platformFee: PlatformFeeResult = await sendPlatformFeeIfEnabled(exportedWallet.secretKey, wallet.address).catch(
+      const platformFee: PlatformFeeResult = await sendPlatformFeeIfEnabled(exportedWallet.secretKey, wallet!.address).catch(
         (error): PlatformFeeResult => ({
           error: error instanceof Error ? error.message : String(error)
         })
@@ -1420,6 +1558,10 @@ async function runQueuedLaunch(
   }
 
   if (!actorId) throw new Error("Personal launch job is missing actor id.");
+  if (proposal.launchpad === "robinhood") {
+    const wallet = await getOrCreateRobinhoodWallet("user", String(actorId));
+    return launchWithRobinhoodBags(proposal, getRobinhoodWalletSecret("user", String(actorId)).privateKey, wallet.address);
+  }
   const wallet = await getOrCreateWallet("user", String(actorId));
   return launchWithPumpFunSdk(proposal, exportWalletSecretBase58("user", String(actorId)).secretKey, wallet.address);
 }
@@ -1435,6 +1577,11 @@ function isRetryableLaunchJobError(error: unknown): boolean {
 
 async function assertGroupLaunchReady(proposal: Proposal, groupId: string, walletAddress: string): Promise<void> {
   const problems: string[] = [];
+  if (proposal.launchpad === "robinhood") {
+    await assertRobinhoodLaunchReady(proposal, walletAddress, "group");
+    return;
+  }
+
   const suffix = mintSuffixForLaunchpad(proposal.launchpad);
   const devBuySol = proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL;
   const priorityFeeSol = priorityFeeForLaunchpad(proposal.launchpad);
@@ -1508,6 +1655,11 @@ async function assertGroupLaunchReady(proposal: Proposal, groupId: string, walle
 
 async function assertPersonalLaunchReady(proposal: Proposal, walletAddress: string): Promise<void> {
   const problems: string[] = [];
+  if (proposal.launchpad === "robinhood") {
+    await assertRobinhoodLaunchReady(proposal, walletAddress, "personal");
+    return;
+  }
+
   const suffix = mintSuffixForLaunchpad(proposal.launchpad);
   const devBuySol = proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL;
   const priorityFeeSol = priorityFeeForLaunchpad(proposal.launchpad);
@@ -1566,6 +1718,64 @@ async function assertPersonalLaunchReady(proposal: Proposal, walletAddress: stri
 
   if (problems.length > 0) {
     throw new Error(`Personal launch preflight failed:\n- ${problems.join("\n- ")}`);
+  }
+}
+
+async function assertRobinhoodLaunchReady(proposal: Proposal, walletAddress: string, mode: "group" | "personal"): Promise<void> {
+  const problems: string[] = [];
+  const devBuyEth = proposal.devBuyEth ?? config.DEFAULT_DEV_BUY_ETH;
+  const platformFeeEth = config.ROBINHOOD_PLATFORM_FEE_ETH > 0 ? config.ROBINHOOD_PLATFORM_FEE_ETH : 0;
+  const estimatedMinimum = devBuyEth + platformFeeEth + 0.025;
+
+  if (!proposal.image) problems.push("proposal has no image");
+  if (!config.PINATA_JWT) problems.push("PINATA_JWT is missing");
+  if (!isValidEvmAddress(walletAddress)) problems.push(`${mode} Robinhood wallet is not a valid EVM address`);
+  if (platformFeeEth > 0 && !config.ROBINHOOD_PLATFORM_TREASURY_WALLET) {
+    problems.push("ROBINHOOD_PLATFORM_TREASURY_WALLET is missing");
+  }
+  if (
+    platformFeeEth > 0 &&
+    config.ROBINHOOD_PLATFORM_TREASURY_WALLET &&
+    !isValidEvmAddress(config.ROBINHOOD_PLATFORM_TREASURY_WALLET)
+  ) {
+    problems.push("ROBINHOOD_PLATFORM_TREASURY_WALLET is not a valid EVM address");
+  }
+
+  try {
+    const balance = await getEthBalance(walletAddress);
+    if (balance < estimatedMinimum) {
+      problems.push(
+        `${mode} Robinhood wallet has ${balance.toFixed(6)} ETH; needs roughly ${estimatedMinimum.toFixed(
+          6
+        )} ETH for creation fee, dev buy, platform fee, and gas`
+      );
+    }
+  } catch (error) {
+    console.warn(
+      `[preflight:${proposal.id}] could not read Robinhood wallet balance from RPC: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  }
+
+  if (proposal.image) {
+    try {
+      await testLaunchImageFetch(proposal);
+    } catch (error) {
+      if (isTransientNetworkError(error)) {
+        console.warn(
+          `[preflight:${proposal.id}] image fetch check skipped due network timeout: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      } else {
+        problems.push(`image is not launch-ready: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+
+  if (problems.length > 0) {
+    throw new Error(`Robinhood launch preflight failed:\n- ${problems.join("\n- ")}`);
   }
 }
 
@@ -1640,6 +1850,10 @@ function isValidSolanaAddress(address: string): boolean {
   } catch {
     return false;
   }
+}
+
+function isValidEvmAddress(address: string): boolean {
+  return /^0x[a-fA-F0-9]{40}$/.test(address.trim());
 }
 
 function parseOnOff(value: string): boolean {
@@ -1820,7 +2034,7 @@ function parseIdeaCommandShortcut(text: string): Partial<CoinIdeaInput> {
   const [, rawLaunchpad, ...rest] = text.trim().split(/\s+/);
   const data: Partial<CoinIdeaInput> = {};
 
-  if (rawLaunchpad === "pumpfun" || rawLaunchpad === "bonk") {
+  if (rawLaunchpad === "pumpfun" || rawLaunchpad === "bonk" || rawLaunchpad === "robinhood") {
     data.launchpad = rawLaunchpad;
   } else if (rawLaunchpad === "bags") {
     data.launchpad = rawLaunchpad;
@@ -1875,8 +2089,10 @@ async function applyWizardText(ctx: Context, draft: Draft, value: string): Promi
     draft.data.image = value;
   } else if (draft.step === "devBuy") {
     const amount = Number(value);
-    if (!Number.isFinite(amount) || amount <= 0) throw new Error("Send a valid SOL amount, like 0.01.");
-    draft.data.devBuySol = amount;
+    const unit = draft.data.launchpad === "robinhood" ? "ETH" : "SOL";
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error(`Send a valid ${unit} amount, like 0.01.`);
+    if (draft.data.launchpad === "robinhood") draft.data.devBuyEth = amount;
+    else draft.data.devBuySol = amount;
   } else if (draft.step === "feeShares") {
     draft.data.pumpfunFeeShares = normalizeFeeShareSetting(value);
   } else if (draft.step === "feeShareWallet") {
@@ -1951,7 +2167,10 @@ function wizardQuestion(step: DraftStep): {
           { text: "🚀 Pump.fun", callback_data: "wizard:launchpad:pumpfun" },
           { text: "🟠 Bonk", callback_data: "wizard:launchpad:bonk" }
         ],
-        [{ text: "🎒 Bags", callback_data: "wizard:launchpad:bags" }],
+        [
+          { text: "🎒 Bags", callback_data: "wizard:launchpad:bags" },
+          { text: "🟢 Robinhood", callback_data: "wizard:launchpad:robinhood" }
+        ],
         [{ text: "❌ Cancel", callback_data: "wizard:cancel" }]
       ]
     };
@@ -1970,7 +2189,7 @@ function wizardQuestion(step: DraftStep): {
       "Reply to this message with the Telegram/community link, use this group, tap Skip, or send <code>/skip</code>.",
     twitter: "Reply to this message with the Twitter/X link, tap Skip, or send <code>/skip</code>.",
     image: "Reply with an image URL or upload the image as a reply. Image is required for launch metadata.",
-    devBuy: "Choose 0.01 SOL, 0.05 SOL, or tap Custom and send any positive SOL amount.",
+    devBuy: "Choose the initial buy amount, or tap Custom and send any positive amount.",
     cashback: "Pump.fun cashback uses the V2 create flow. Enable it only if you want cashback on this launch.",
     feeShares:
       "Choose Pump.fun creator-fee sharing. This can lock reward distribution once configured.",
@@ -1993,8 +2212,8 @@ function wizardQuestion(step: DraftStep): {
     image: [[{ text: "❌ Cancel", callback_data: "wizard:cancel" }]],
     devBuy: [
       [
-        { text: "0.01 SOL", callback_data: "wizard:devbuy:0.01" },
-        { text: "0.05 SOL", callback_data: "wizard:devbuy:0.05" },
+        { text: "0.01", callback_data: "wizard:devbuy:0.01" },
+        { text: "0.05", callback_data: "wizard:devbuy:0.05" },
         { text: "Custom", callback_data: "wizard:devbuy_custom" }
       ],
       [{ text: "❌ Cancel", callback_data: "wizard:cancel" }]
@@ -2134,7 +2353,25 @@ function walletMessage(title: string, wallet: WalletView): string {
   const providerLabel =
     wallet.provider === "pumpportal"
       ? "Launch Wallet (Pump.fun SDK + Bonk API)"
+      : wallet.provider === "evm"
+        ? "Robinhood Chain Wallet"
       : "Launch Wallet";
+  const balanceLine =
+    wallet.provider === "evm"
+      ? wallet.balanceEth === undefined
+        ? wallet.balanceError
+          ? `Balance: unavailable right now (${escapeHtml(wallet.balanceError)})`
+          : `Balance: use <code>/rhgroupbalance</code> or <code>/rhmybalance</code> to refresh`
+        : `Balance: <b>${wallet.balanceEth.toFixed(6)} ETH</b>`
+      : wallet.balanceSol === undefined
+        ? wallet.balanceError
+          ? `Balance: unavailable right now (${escapeHtml(wallet.balanceError)})`
+          : `Balance: use <code>/groupbalance</code> to refresh`
+        : `Balance: <b>${wallet.balanceSol.toFixed(6)} SOL</b>`;
+  const fundingText =
+    wallet.provider === "evm"
+      ? "Deposit Robinhood Chain ETH to this address. The private key is encrypted and never shown in Telegram."
+      : "Deposit SOL to this address. Pump.fun signs with this encrypted wallet; Bonk uses its encrypted API key. The private key is never shown in Telegram.";
 
   return [
     `<b>${escapeHtml(title)}</b>`,
@@ -2143,13 +2380,9 @@ function walletMessage(title: string, wallet: WalletView): string {
     `Provider: <b>${providerLabel}</b>`,
     wallet.hasApiKey ? "Bonk API key: <b>encrypted</b>" : undefined,
     `Address: <code>${escapeHtml(wallet.address)}</code>`,
-    wallet.balanceSol === undefined
-      ? wallet.balanceError
-        ? `Balance: unavailable right now (${escapeHtml(wallet.balanceError)})`
-        : `Balance: use <code>/groupbalance</code> to refresh`
-      : `Balance: <b>${wallet.balanceSol.toFixed(6)} SOL</b>`,
+    balanceLine,
     "",
-    "Deposit SOL to this address. Pump.fun signs with this encrypted wallet; Bonk uses its encrypted API key. The private key is never shown in Telegram."
+    fundingText
   ]
     .filter(Boolean)
     .join("\n");
@@ -2179,10 +2412,19 @@ async function withBalance(wallet: WalletView): Promise<WalletView> {
   };
 }
 
+async function withEthBalance(wallet: WalletView): Promise<WalletView> {
+  return {
+    ...wallet,
+    balanceEth: await getEthBalance(wallet.address),
+    balanceError: undefined
+  };
+}
+
 function withBalanceError(wallet: WalletView, error: unknown): WalletView {
   return {
     ...wallet,
     balanceSol: undefined,
+    balanceEth: undefined,
     balanceError: error instanceof Error ? error.message : String(error)
   };
 }
@@ -2376,7 +2618,11 @@ async function setupBotCommands(): Promise<void> {
     { command: "groupbalance", description: "Check the group launch wallet balance" },
     { command: "mywallet", description: "Create/show your personal launch wallet" },
     { command: "mybalance", description: "Check your personal wallet balance" },
-    { command: "launchme", description: "Launch your own Pump.fun proposal" },
+    { command: "rhgroupwallet", description: "Create/show Robinhood group wallet" },
+    { command: "rhgroupbalance", description: "Check Robinhood group wallet balance" },
+    { command: "rhmywallet", description: "Create/show Robinhood personal wallet" },
+    { command: "rhmybalance", description: "Check Robinhood personal wallet balance" },
+    { command: "launchme", description: "Launch your own proposal" },
     { command: "feesettings", description: "Show proposal fee settings" },
     { command: "cashback", description: "Set Pump.fun cashback on/off" },
     { command: "setfees", description: "Set Pump.fun fee sharing" },
