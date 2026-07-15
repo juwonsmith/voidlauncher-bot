@@ -1,0 +1,44 @@
+services:
+  - type: web
+    name: voidlauncher-bot
+    env: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install && npm run build
+    startCommand: HEALTHCHECK_PORT=$PORT npm start
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 20.18.0
+      - key: DATABASE_PATH
+        value: ./data/bot.sqlite
+      - key: DRY_RUN
+        value: "true"
+      - key: ALLOW_GROUP_ADMINS
+        value: "true"
+      - key: ROBINHOOD_RPC_URL
+        value: https://rpc.mainnet.chain.robinhood.com
+      - key: ROBINHOOD_PLATFORM_TREASURY_WALLET
+        value: 0x8fd406e046C6A81aFa85E0b1638d417b6161dE5e
+      - key: ROBINHOOD_PLATFORM_FEE_ETH
+        value: "0.005"
+      - key: DEFAULT_DEV_BUY_ETH
+        value: "0.01"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ADMIN_TELEGRAM_IDS
+        sync: false
+      - key: WALLET_ENCRYPTION_KEY
+        sync: false
+      - key: PUMPFUN_SIGNER_PRIVATE_KEY
+        sync: false
+      - key: PUMPPORTAL_API_KEY
+        sync: false
+      - key: BAGS_API_KEY
+        sync: false
+      - key: PINATA_JWT
+        sync: false
+      - key: SOLANA_RPC_URL
+        sync: false
+      - key: PLATFORM_TREASURY_WALLET
+        sync: false
