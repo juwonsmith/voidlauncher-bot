@@ -2603,6 +2603,11 @@ async function launchBotWithRetry(): Promise<void> {
     } catch (error) {
       const delayMs = Math.min(60_000, 2_000 * attempt);
       logError("telegram_polling_start_failed", error, { attempt, retryInSeconds: Math.round(delayMs / 1000) });
+      try {
+        bot.stop("polling retry");
+      } catch {
+        // Telegraf throws if polling never fully started. That is fine; the next loop starts cleanly.
+      }
       await new Promise((resolve) => setTimeout(resolve, delayMs));
       attempt += 1;
     }
