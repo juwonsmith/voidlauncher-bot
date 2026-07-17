@@ -23,8 +23,8 @@ export interface WalletView {
 
 export async function getOrCreateRobinhoodWallet(scope: "group" | "user", scopeId: string): Promise<WalletView> {
   const storageScope = robinhoodStorageScope(scope);
-  const existing = getWallet(storageScope, scopeId);
-  const wallet = existing ?? createEncryptedEvmWallet(storageScope, scopeId);
+  const existing = await getWallet(storageScope, scopeId);
+  const wallet = existing ?? (await createEncryptedEvmWallet(storageScope, scopeId));
   return {
     scope: storageScope,
     scopeId,
@@ -36,8 +36,8 @@ export async function getOrCreateRobinhoodWallet(scope: "group" | "user", scopeI
 }
 
 export async function getOrCreateWallet(scope: WalletScope, scopeId: string): Promise<WalletView> {
-  const existing = getWallet(scope, scopeId);
-  const wallet = existing ?? createEncryptedWallet(scope, scopeId);
+  const existing = await getWallet(scope, scopeId);
+  const wallet = existing ?? (await createEncryptedWallet(scope, scopeId));
   return {
     scope,
     scopeId,
@@ -50,7 +50,7 @@ export async function getOrCreateWallet(scope: WalletScope, scopeId: string): Pr
 
 export async function getOrCreatePumpPortalWallet(scope: WalletScope, scopeId: string): Promise<WalletView> {
   const storageScope = pumpPortalStorageScope(scope);
-  const existing = getWallet(storageScope, scopeId);
+  const existing = await getWallet(storageScope, scopeId);
   if (existing) {
     if (existing.provider !== "pumpportal" || !existing.encryptedApiKey) {
       throw new Error(
@@ -80,7 +80,7 @@ export async function getOrCreatePumpPortalWallet(scope: WalletScope, scopeId: s
 }
 
 export async function getWalletView(scope: WalletScope, scopeId: string): Promise<WalletView | undefined> {
-  const wallet = getWallet(scope, scopeId);
+  const wallet = await getWallet(scope, scopeId);
   if (!wallet) return undefined;
 
   return {
@@ -94,8 +94,8 @@ export async function getWalletView(scope: WalletScope, scopeId: string): Promis
   };
 }
 
-export function getWalletSummary(scope: WalletScope, scopeId: string): WalletView | undefined {
-  const wallet = getWallet(scope, scopeId);
+export async function getWalletSummary(scope: WalletScope, scopeId: string): Promise<WalletView | undefined> {
+  const wallet = await getWallet(scope, scopeId);
   if (!wallet) return undefined;
 
   return {
@@ -125,8 +125,11 @@ export function decryptWalletSecret(wallet: StoredWallet): Uint8Array {
   return new Uint8Array(decrypted);
 }
 
-export function exportWalletSecretBase58(scope: WalletScope, scopeId: string): { address: string; secretKey: string } {
-  const wallet = getWallet(scope, scopeId);
+export async function exportWalletSecretBase58(
+  scope: WalletScope,
+  scopeId: string
+): Promise<{ address: string; secretKey: string }> {
+  const wallet = await getWallet(scope, scopeId);
   if (!wallet) throw new Error("Wallet not found.");
 
   const decrypted = Buffer.from(decryptWalletSecret(wallet)).toString("utf8");
@@ -136,12 +139,12 @@ export function exportWalletSecretBase58(scope: WalletScope, scopeId: string): {
   };
 }
 
-export function exportPumpPortalWallet(scope: WalletScope, scopeId: string): {
+export async function exportPumpPortalWallet(scope: WalletScope, scopeId: string): Promise<{
   address: string;
   secretKey: string;
   apiKey: string;
-} {
-  const wallet = getWallet(pumpPortalStorageScope(scope), scopeId);
+}> {
+  const wallet = await getWallet(pumpPortalStorageScope(scope), scopeId);
   if (!wallet) throw new Error("Wallet not found.");
   if (!wallet.encryptedApiKey) throw new Error("This wallet does not have a PumpPortal API key.");
 
@@ -152,8 +155,11 @@ export function exportPumpPortalWallet(scope: WalletScope, scopeId: string): {
   };
 }
 
-export function getPumpPortalApiKey(scope: WalletScope, scopeId: string): { address: string; apiKey: string } {
-  const wallet = getWallet(pumpPortalStorageScope(scope), scopeId);
+export async function getPumpPortalApiKey(
+  scope: WalletScope,
+  scopeId: string
+): Promise<{ address: string; apiKey: string }> {
+  const wallet = await getWallet(pumpPortalStorageScope(scope), scopeId);
   if (!wallet) throw new Error("Wallet not found.");
   if (!wallet.encryptedApiKey) {
     throw new Error("This wallet is not linked to PumpPortal. Run /groupwallet to create a PumpPortal launch wallet.");
@@ -165,15 +171,18 @@ export function getPumpPortalApiKey(scope: WalletScope, scopeId: string): { addr
   };
 }
 
-export function getWalletSecretBase58(scope: WalletScope, scopeId: string): { address: string; secretKey: string } {
+export async function getWalletSecretBase58(
+  scope: WalletScope,
+  scopeId: string
+): Promise<{ address: string; secretKey: string }> {
   return exportWalletSecretBase58(scope, scopeId);
 }
 
-export function getRobinhoodWalletSecret(scope: "group" | "user", scopeId: string): {
+export async function getRobinhoodWalletSecret(scope: "group" | "user", scopeId: string): Promise<{
   address: `0x${string}`;
   privateKey: `0x${string}`;
-} {
-  const wallet = getWallet(robinhoodStorageScope(scope), scopeId);
+}> {
+  const wallet = await getWallet(robinhoodStorageScope(scope), scopeId);
   if (!wallet) throw new Error("Robinhood wallet not found. Create it with /rhgroupwallet or /rhmywallet.");
   if (wallet.provider !== "evm") throw new Error("Stored wallet is not a Robinhood/EVM wallet.");
 
@@ -269,14 +278,14 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function createEncryptedWallet(scope: WalletScope, scopeId: string): StoredWallet {
+async function createEncryptedWallet(scope: WalletScope, scopeId: string): Promise<StoredWallet> {
   const keypair = nacl.sign.keyPair();
   const address = bs58.encode(keypair.publicKey);
   const secretKeyBase58 = bs58.encode(keypair.secretKey);
   return createWalletRecord(scope, scopeId, address, encryptSecret(secretKeyBase58));
 }
 
-function createEncryptedEvmWallet(scope: WalletScope, scopeId: string): StoredWallet {
+async function createEncryptedEvmWallet(scope: WalletScope, scopeId: string): Promise<StoredWallet> {
   const privateKey = generatePrivateKey();
   const account = privateKeyToAccount(privateKey);
   return createWalletRecord(scope, scopeId, account.address, encryptSecret(privateKey), "evm");

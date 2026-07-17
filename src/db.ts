@@ -1,159 +1,30 @@
-import Database from "better-sqlite3";
-import fs from "node:fs";
-import path from "node:path";
+import dns from "node:dns";
+import { Pool, type PoolClient, type QueryResultRow } from "pg";
 import { config } from "./config.js";
 import type { CoinIdeaInput, Proposal } from "./types.js";
 
-const databaseDir = path.dirname(config.DATABASE_PATH);
-fs.mkdirSync(databaseDir, { recursive: true });
-
-const db = new Database(config.DATABASE_PATH);
-db.pragma("journal_mode = WAL");
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS proposals (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    launchpad TEXT NOT NULL,
-    name TEXT NOT NULL,
-    symbol TEXT NOT NULL,
-    description TEXT NOT NULL,
-    website TEXT,
-    telegram TEXT,
-    twitter TEXT,
-    image TEXT,
-    dev_buy_sol REAL,
-    dev_buy_eth REAL,
-    pumpfun_cashback INTEGER,
-    pumpfun_fee_shares TEXT,
-    status TEXT NOT NULL DEFAULT 'pending',
-    created_by INTEGER NOT NULL,
-    created_by_username TEXT,
-    created_at TEXT NOT NULL,
-    approved_by INTEGER,
-    approved_at TEXT,
-    rejection_reason TEXT,
-    launch_signature TEXT
-  )
-`);
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS vanity_mints (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    suffix TEXT NOT NULL,
-    address TEXT NOT NULL UNIQUE,
-    secret_key_base58 TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'available',
-    created_at TEXT NOT NULL,
-    reserved_at TEXT,
-    used_at TEXT,
-    proposal_id INTEGER
+if (!config.DATABASE_URL) {
+  throw new Error(
+    "DATABASE_URL is required. Configure a persistent Postgres database before starting the bot."
   );
-
-  CREATE INDEX IF NOT EXISTS idx_vanity_mints_status_suffix
-    ON vanity_mints(status, suffix, id);
-`);
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS wallets (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    scope TEXT NOT NULL,
-    scope_id TEXT NOT NULL,
-    address TEXT NOT NULL UNIQUE,
-    encrypted_secret_key TEXT NOT NULL,
-    encrypted_api_key TEXT,
-    provider TEXT NOT NULL DEFAULT 'local',
-    created_at TEXT NOT NULL,
-    UNIQUE(scope, scope_id)
-  );
-`);
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS audit_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    action TEXT NOT NULL,
-    actor_id INTEGER,
-    actor_username TEXT,
-    chat_id TEXT,
-    proposal_id INTEGER,
-    details TEXT,
-    created_at TEXT NOT NULL
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
-  CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
-
-  CREATE TABLE IF NOT EXISTS launch_attempts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    proposal_id INTEGER NOT NULL,
-    launchpad TEXT NOT NULL,
-    mode TEXT NOT NULL,
-    payer_address TEXT,
-    chat_id TEXT,
-    actor_id INTEGER,
-    status TEXT NOT NULL,
-    signature TEXT,
-    mint TEXT,
-    error TEXT,
-    created_at TEXT NOT NULL,
-    completed_at TEXT
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_launch_attempts_proposal ON launch_attempts(proposal_id, created_at);
-  CREATE INDEX IF NOT EXISTS idx_launch_attempts_chat ON launch_attempts(chat_id, created_at);
-  CREATE INDEX IF NOT EXISTS idx_launch_attempts_actor ON launch_attempts(actor_id, created_at);
-
-  CREATE TABLE IF NOT EXISTS launch_jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    proposal_id INTEGER NOT NULL,
-    launchpad TEXT NOT NULL,
-    mode TEXT NOT NULL,
-    chat_id TEXT NOT NULL,
-    actor_id INTEGER,
-    actor_username TEXT,
-    status TEXT NOT NULL DEFAULT 'queued',
-    attempts INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT,
-    signature TEXT,
-    mint TEXT,
-    created_at TEXT NOT NULL,
-    run_after TEXT NOT NULL,
-    started_at TEXT,
-    completed_at TEXT
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_launch_jobs_status_run_after ON launch_jobs(status, run_after, id);
-  CREATE INDEX IF NOT EXISTS idx_launch_jobs_proposal ON launch_jobs(proposal_id, created_at);
-`);
-
-try {
-  db.prepare("ALTER TABLE wallets ADD COLUMN encrypted_api_key TEXT").run();
-} catch {
-  // Column already exists.
 }
 
-try {
-  db.prepare("ALTER TABLE wallets ADD COLUMN provider TEXT NOT NULL DEFAULT 'local'").run();
-} catch {
-  // Column already exists.
-}
+// Some Windows/ISP combinations resolve Neon's IPv6 address without providing
+// a working IPv6 route. Prefer IPv4 while retaining normal DNS fallback.
+dns.setDefaultResultOrder("ipv4first");
 
-try {
-  db.prepare("ALTER TABLE proposals ADD COLUMN pumpfun_cashback INTEGER").run();
-} catch {
-  // Column already exists.
-}
+const pool = new Pool({
+  connectionString: config.DATABASE_URL,
+  max: config.DATABASE_POOL_MAX,
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: config.DATABASE_CONNECT_TIMEOUT_MS
+});
 
-try {
-  db.prepare("ALTER TABLE proposals ADD COLUMN pumpfun_fee_shares TEXT").run();
-} catch {
-  // Column already exists.
-}
+pool.on("error", (error) => {
+  console.error("Unexpected Postgres pool error", error);
+});
 
-try {
-  db.prepare("ALTER TABLE proposals ADD COLUMN dev_buy_eth REAL").run();
-} catch {
-  // Column already exists.
-}
+const databaseReady = initializeDatabase();
 
 export interface VanityMint {
   id: number;
@@ -226,7 +97,129 @@ export interface LaunchJobInput {
   actorUsername?: string;
 }
 
-function mapWallet(row: Record<string, unknown>): StoredWallet {
+async function initializeDatabase(): Promise<void> {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS proposals (
+      id BIGSERIAL PRIMARY KEY,
+      launchpad TEXT NOT NULL,
+      name TEXT NOT NULL,
+      symbol TEXT NOT NULL,
+      description TEXT NOT NULL,
+      website TEXT,
+      telegram TEXT,
+      twitter TEXT,
+      image TEXT,
+      dev_buy_sol DOUBLE PRECISION,
+      dev_buy_eth DOUBLE PRECISION,
+      pumpfun_cashback BOOLEAN,
+      pumpfun_fee_shares TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_by BIGINT NOT NULL,
+      created_by_username TEXT,
+      created_at TIMESTAMPTZ NOT NULL,
+      approved_by BIGINT,
+      approved_at TIMESTAMPTZ,
+      rejection_reason TEXT,
+      launch_signature TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS vanity_mints (
+      id BIGSERIAL PRIMARY KEY,
+      suffix TEXT NOT NULL,
+      address TEXT NOT NULL UNIQUE,
+      secret_key_base58 TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'available',
+      created_at TIMESTAMPTZ NOT NULL,
+      reserved_at TIMESTAMPTZ,
+      used_at TIMESTAMPTZ,
+      proposal_id BIGINT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_vanity_mints_status_suffix
+      ON vanity_mints(status, suffix, id);
+
+    CREATE TABLE IF NOT EXISTS wallets (
+      id BIGSERIAL PRIMARY KEY,
+      scope TEXT NOT NULL,
+      scope_id TEXT NOT NULL,
+      address TEXT NOT NULL UNIQUE,
+      encrypted_secret_key TEXT NOT NULL,
+      encrypted_api_key TEXT,
+      provider TEXT NOT NULL DEFAULT 'local',
+      created_at TIMESTAMPTZ NOT NULL,
+      UNIQUE(scope, scope_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id BIGSERIAL PRIMARY KEY,
+      action TEXT NOT NULL,
+      actor_id BIGINT,
+      actor_username TEXT,
+      chat_id TEXT,
+      proposal_id BIGINT,
+      details JSONB,
+      created_at TIMESTAMPTZ NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
+
+    CREATE TABLE IF NOT EXISTS launch_attempts (
+      id BIGSERIAL PRIMARY KEY,
+      proposal_id BIGINT NOT NULL,
+      launchpad TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      payer_address TEXT,
+      chat_id TEXT,
+      actor_id BIGINT,
+      status TEXT NOT NULL,
+      signature TEXT,
+      mint TEXT,
+      error TEXT,
+      created_at TIMESTAMPTZ NOT NULL,
+      completed_at TIMESTAMPTZ
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_launch_attempts_proposal ON launch_attempts(proposal_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_launch_attempts_chat ON launch_attempts(chat_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_launch_attempts_actor ON launch_attempts(actor_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS launch_jobs (
+      id BIGSERIAL PRIMARY KEY,
+      proposal_id BIGINT NOT NULL,
+      launchpad TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      actor_id BIGINT,
+      actor_username TEXT,
+      status TEXT NOT NULL DEFAULT 'queued',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      signature TEXT,
+      mint TEXT,
+      created_at TIMESTAMPTZ NOT NULL,
+      run_after TIMESTAMPTZ NOT NULL,
+      started_at TIMESTAMPTZ,
+      completed_at TIMESTAMPTZ
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_launch_jobs_status_run_after ON launch_jobs(status, run_after, id);
+    CREATE INDEX IF NOT EXISTS idx_launch_jobs_proposal ON launch_jobs(proposal_id, created_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_launch_jobs_active_proposal_mode
+      ON launch_jobs(proposal_id, mode) WHERE status IN ('queued', 'running');
+  `);
+}
+
+export async function assertDatabaseReady(): Promise<void> {
+  await databaseReady;
+  await pool.query("SELECT 1");
+}
+
+export async function closeDatabase(): Promise<void> {
+  await pool.end();
+}
+
+function mapWallet(row: QueryResultRow): StoredWallet {
   return {
     id: Number(row.id),
     scope: row.scope as StoredWallet["scope"],
@@ -235,45 +228,45 @@ function mapWallet(row: Record<string, unknown>): StoredWallet {
     encryptedSecretKey: String(row.encrypted_secret_key),
     encryptedApiKey: row.encrypted_api_key ? String(row.encrypted_api_key) : undefined,
     provider: (row.provider ? String(row.provider) : "local") as StoredWallet["provider"],
-    createdAt: String(row.created_at)
+    createdAt: asIso(row.created_at)
   };
 }
 
-export function getWallet(scope: StoredWallet["scope"], scopeId: string): StoredWallet | undefined {
-  const row = db.prepare("SELECT * FROM wallets WHERE scope = ? AND scope_id = ?").get(scope, scopeId) as
-    | Record<string, unknown>
-    | undefined;
-  return row ? mapWallet(row) : undefined;
+export async function getWallet(scope: StoredWallet["scope"], scopeId: string): Promise<StoredWallet | undefined> {
+  await databaseReady;
+  const result = await pool.query("SELECT * FROM wallets WHERE scope = $1 AND scope_id = $2", [scope, scopeId]);
+  return result.rows[0] ? mapWallet(result.rows[0]) : undefined;
 }
 
-export function listWallets(scope: StoredWallet["scope"]): StoredWallet[] {
-  const rows = db.prepare("SELECT * FROM wallets WHERE scope = ? ORDER BY created_at DESC").all(scope) as Record<
-    string,
-    unknown
-  >[];
-  return rows.map(mapWallet);
+export async function listWallets(scope: StoredWallet["scope"]): Promise<StoredWallet[]> {
+  await databaseReady;
+  const result = await pool.query("SELECT * FROM wallets WHERE scope = $1 ORDER BY created_at DESC", [scope]);
+  return result.rows.map(mapWallet);
 }
 
-export function createWalletRecord(
+export async function createWalletRecord(
   scope: StoredWallet["scope"],
   scopeId: string,
   address: string,
   encryptedSecretKey: string,
   provider: StoredWallet["provider"] = "local",
   encryptedApiKey?: string
-): StoredWallet {
-  const createdAt = new Date().toISOString();
-  db.prepare(
+): Promise<StoredWallet> {
+  await databaseReady;
+  const result = await pool.query(
     `INSERT INTO wallets (scope, scope_id, address, encrypted_secret_key, encrypted_api_key, provider, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(scope, scopeId, address, encryptedSecretKey, encryptedApiKey ?? null, provider, createdAt);
-
-  const wallet = getWallet(scope, scopeId);
-  if (!wallet) throw new Error("Failed to read wallet after insert.");
-  return wallet;
+     VALUES ($1, $2, $3, $4, $5, $6, NOW())
+     ON CONFLICT (scope, scope_id) DO NOTHING
+     RETURNING *`,
+    [scope, scopeId, address, encryptedSecretKey, encryptedApiKey ?? null, provider]
+  );
+  if (result.rows[0]) return mapWallet(result.rows[0]);
+  const existing = await getWallet(scope, scopeId);
+  if (!existing) throw new Error("Failed to read wallet after insert.");
+  return existing;
 }
 
-function mapProposal(row: Record<string, unknown>): Proposal {
+function mapProposal(row: QueryResultRow): Proposal {
   return {
     id: Number(row.id),
     launchpad: row.launchpad as Proposal["launchpad"],
@@ -284,35 +277,35 @@ function mapProposal(row: Record<string, unknown>): Proposal {
     telegram: row.telegram ? String(row.telegram) : undefined,
     twitter: row.twitter ? String(row.twitter) : undefined,
     image: row.image ? String(row.image) : undefined,
-    devBuySol: row.dev_buy_sol ? Number(row.dev_buy_sol) : undefined,
-    devBuyEth: row.dev_buy_eth ? Number(row.dev_buy_eth) : undefined,
-    pumpfunCashback: row.pumpfun_cashback === null || row.pumpfun_cashback === undefined ? undefined : Boolean(row.pumpfun_cashback),
+    devBuySol: row.dev_buy_sol === null || row.dev_buy_sol === undefined ? undefined : Number(row.dev_buy_sol),
+    devBuyEth: row.dev_buy_eth === null || row.dev_buy_eth === undefined ? undefined : Number(row.dev_buy_eth),
+    pumpfunCashback:
+      row.pumpfun_cashback === null || row.pumpfun_cashback === undefined ? undefined : Boolean(row.pumpfun_cashback),
     pumpfunFeeShares: row.pumpfun_fee_shares ? String(row.pumpfun_fee_shares) : undefined,
     status: row.status as Proposal["status"],
     createdBy: Number(row.created_by),
     createdByUsername: row.created_by_username ? String(row.created_by_username) : undefined,
-    createdAt: String(row.created_at),
-    approvedBy: row.approved_by ? Number(row.approved_by) : undefined,
-    approvedAt: row.approved_at ? String(row.approved_at) : undefined,
+    createdAt: asIso(row.created_at),
+    approvedBy: row.approved_by === null || row.approved_by === undefined ? undefined : Number(row.approved_by),
+    approvedAt: row.approved_at ? asIso(row.approved_at) : undefined,
     rejectionReason: row.rejection_reason ? String(row.rejection_reason) : undefined,
     launchSignature: row.launch_signature ? String(row.launch_signature) : undefined
   };
 }
 
-export function createProposal(
+export async function createProposal(
   idea: CoinIdeaInput,
   createdBy: number,
   createdByUsername?: string
-): Proposal {
-  const createdAt = new Date().toISOString();
-  const result = db
-    .prepare(
-      `INSERT INTO proposals (
-        launchpad, name, symbol, description, website, telegram, twitter, image,
-        dev_buy_sol, dev_buy_eth, pumpfun_cashback, pumpfun_fee_shares, created_by, created_by_username, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
+): Promise<Proposal> {
+  await databaseReady;
+  const result = await pool.query(
+    `INSERT INTO proposals (
+      launchpad, name, symbol, description, website, telegram, twitter, image,
+      dev_buy_sol, dev_buy_eth, pumpfun_cashback, pumpfun_fee_shares, created_by, created_by_username, created_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+    RETURNING *`,
+    [
       idea.launchpad,
       idea.name,
       idea.symbol.toUpperCase(),
@@ -323,121 +316,124 @@ export function createProposal(
       idea.image ?? null,
       idea.devBuySol ?? null,
       idea.devBuyEth ?? null,
-      idea.pumpfunCashback === undefined ? null : Number(idea.pumpfunCashback),
+      idea.pumpfunCashback ?? null,
       idea.pumpfunFeeShares ?? null,
       createdBy,
-      createdByUsername ?? null,
-      createdAt
-    );
-
-  const proposal = getProposal(Number(result.lastInsertRowid));
-  if (!proposal) throw new Error("Failed to read proposal after insert.");
-  return proposal;
-}
-
-export function updateProposalCashback(id: number, enabled: boolean): Proposal | undefined {
-  db.prepare("UPDATE proposals SET pumpfun_cashback = ? WHERE id = ? AND status IN ('pending', 'approved')").run(
-    Number(enabled),
-    id
+      createdByUsername ?? null
+    ]
   );
-  return getProposal(id);
+  return mapProposal(result.rows[0]);
 }
 
-export function updateProposalFeeShares(id: number, feeShares?: string): Proposal | undefined {
-  db.prepare("UPDATE proposals SET pumpfun_fee_shares = ? WHERE id = ? AND status IN ('pending', 'approved')").run(
-    feeShares?.trim() || null,
-    id
+export async function updateProposalCashback(id: number, enabled: boolean): Promise<Proposal | undefined> {
+  await databaseReady;
+  const result = await pool.query(
+    "UPDATE proposals SET pumpfun_cashback = $1 WHERE id = $2 AND status IN ('pending', 'approved') RETURNING *",
+    [enabled, id]
   );
-  return getProposal(id);
+  return result.rows[0] ? mapProposal(result.rows[0]) : getProposal(id);
 }
 
-export function getProposal(id: number): Proposal | undefined {
-  const row = db.prepare("SELECT * FROM proposals WHERE id = ?").get(id) as
-    | Record<string, unknown>
-    | undefined;
-  return row ? mapProposal(row) : undefined;
-}
-
-export function listPendingProposals(limit = 10): Proposal[] {
-  const rows = db
-    .prepare("SELECT * FROM proposals WHERE status = 'pending' ORDER BY id ASC LIMIT ?")
-    .all(limit) as Record<string, unknown>[];
-  return rows.map(mapProposal);
-}
-
-export function approveProposal(id: number, adminId: number): Proposal | undefined {
-  db.prepare(
-    "UPDATE proposals SET status = 'approved', approved_by = ?, approved_at = ? WHERE id = ? AND status = 'pending'"
-  ).run(adminId, new Date().toISOString(), id);
-  return getProposal(id);
-}
-
-export function rejectProposal(id: number, reason: string): Proposal | undefined {
-  db.prepare(
-    "UPDATE proposals SET status = 'rejected', rejection_reason = ? WHERE id = ? AND status = 'pending'"
-  ).run(reason, id);
-  return getProposal(id);
-}
-
-export function markLaunched(id: number, signature?: string): Proposal | undefined {
-  db.prepare("UPDATE proposals SET status = 'launched', launch_signature = ? WHERE id = ?").run(
-    signature ?? null,
-    id
+export async function updateProposalFeeShares(id: number, feeShares?: string): Promise<Proposal | undefined> {
+  await databaseReady;
+  const result = await pool.query(
+    "UPDATE proposals SET pumpfun_fee_shares = $1 WHERE id = $2 AND status IN ('pending', 'approved') RETURNING *",
+    [feeShares?.trim() || null, id]
   );
-  return getProposal(id);
+  return result.rows[0] ? mapProposal(result.rows[0]) : getProposal(id);
 }
 
-export function createAuditLog(input: AuditLogInput): void {
-  db.prepare(
+export async function getProposal(id: number): Promise<Proposal | undefined> {
+  await databaseReady;
+  const result = await pool.query("SELECT * FROM proposals WHERE id = $1", [id]);
+  return result.rows[0] ? mapProposal(result.rows[0]) : undefined;
+}
+
+export async function listPendingProposals(limit = 10): Promise<Proposal[]> {
+  await databaseReady;
+  const result = await pool.query("SELECT * FROM proposals WHERE status = 'pending' ORDER BY id ASC LIMIT $1", [limit]);
+  return result.rows.map(mapProposal);
+}
+
+export async function approveProposal(id: number, adminId: number): Promise<Proposal | undefined> {
+  await databaseReady;
+  const result = await pool.query(
+    "UPDATE proposals SET status = 'approved', approved_by = $1, approved_at = NOW() WHERE id = $2 AND status = 'pending' RETURNING *",
+    [adminId, id]
+  );
+  return result.rows[0] ? mapProposal(result.rows[0]) : getProposal(id);
+}
+
+export async function rejectProposal(id: number, reason: string): Promise<Proposal | undefined> {
+  await databaseReady;
+  const result = await pool.query(
+    "UPDATE proposals SET status = 'rejected', rejection_reason = $1 WHERE id = $2 AND status = 'pending' RETURNING *",
+    [reason, id]
+  );
+  return result.rows[0] ? mapProposal(result.rows[0]) : getProposal(id);
+}
+
+export async function markLaunched(id: number, signature?: string): Promise<Proposal | undefined> {
+  await databaseReady;
+  const result = await pool.query(
+    "UPDATE proposals SET status = 'launched', launch_signature = $1 WHERE id = $2 RETURNING *",
+    [signature ?? null, id]
+  );
+  return result.rows[0] ? mapProposal(result.rows[0]) : undefined;
+}
+
+export async function createAuditLog(input: AuditLogInput): Promise<void> {
+  await databaseReady;
+  await pool.query(
     `INSERT INTO audit_logs (action, actor_id, actor_username, chat_id, proposal_id, details, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    input.action,
-    input.actorId ?? null,
-    input.actorUsername ?? null,
-    input.chatId ?? null,
-    input.proposalId ?? null,
-    input.details === undefined ? null : JSON.stringify(input.details),
-    new Date().toISOString()
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW())`,
+    [
+      input.action,
+      input.actorId ?? null,
+      input.actorUsername ?? null,
+      input.chatId ?? null,
+      input.proposalId ?? null,
+      input.details === undefined ? null : JSON.stringify(input.details)
+    ]
   );
 }
 
-export function createLaunchAttempt(input: LaunchAttemptInput): number {
-  const result = db
-    .prepare(
-      `INSERT INTO launch_attempts (
-        proposal_id, launchpad, mode, payer_address, chat_id, actor_id, status, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?)`
-    )
-    .run(
-      input.proposalId,
-      input.launchpad,
-      input.mode,
-      input.payerAddress ?? null,
-      input.chatId ?? null,
-      input.actorId ?? null,
-      new Date().toISOString()
-    );
-  return Number(result.lastInsertRowid);
+export async function createLaunchAttempt(input: LaunchAttemptInput): Promise<number> {
+  await databaseReady;
+  const result = await pool.query(
+    `INSERT INTO launch_attempts (
+      proposal_id, launchpad, mode, payer_address, chat_id, actor_id, status, created_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, 'running', NOW()) RETURNING id`,
+    [input.proposalId, input.launchpad, input.mode, input.payerAddress ?? null, input.chatId ?? null, input.actorId ?? null]
+  );
+  return Number(result.rows[0].id);
 }
 
-export function finishLaunchAttempt(id: number, update: LaunchAttemptUpdate): void {
-  db.prepare(
+export async function finishLaunchAttempt(id: number, update: LaunchAttemptUpdate): Promise<void> {
+  await databaseReady;
+  await pool.query(
     `UPDATE launch_attempts
-     SET status = ?, signature = ?, mint = ?, error = ?, completed_at = ?
-     WHERE id = ?`
-  ).run(update.status, update.signature ?? null, update.mint ?? null, update.error ?? null, new Date().toISOString(), id);
+     SET status = $1, signature = $2, mint = $3, error = $4, completed_at = NOW()
+     WHERE id = $5`,
+    [update.status, update.signature ?? null, update.mint ?? null, update.error ?? null, id]
+  );
 }
 
-export function countSuccessfulLaunchesSince(scope: "chat" | "actor", id: string | number, sinceIso: string): number {
+export async function countSuccessfulLaunchesSince(
+  scope: "chat" | "actor",
+  id: string | number,
+  sinceIso: string
+): Promise<number> {
+  await databaseReady;
   const column = scope === "chat" ? "chat_id" : "actor_id";
-  const row = db
-    .prepare(`SELECT COUNT(*) AS count FROM launch_attempts WHERE ${column} = ? AND status = 'success' AND created_at >= ?`)
-    .get(String(id), sinceIso) as { count: number };
-  return Number(row.count);
+  const result = await pool.query(
+    `SELECT COUNT(*) AS count FROM launch_attempts WHERE ${column} = $1 AND status = 'success' AND created_at >= $2`,
+    [String(id), sinceIso]
+  );
+  return Number(result.rows[0].count);
 }
 
-export function recentLaunchAttempts(limit = 8): Array<{
+export async function recentLaunchAttempts(limit = 8): Promise<Array<{
   proposalId: number;
   launchpad: string;
   mode: string;
@@ -446,16 +442,14 @@ export function recentLaunchAttempts(limit = 8): Array<{
   mint?: string;
   error?: string;
   createdAt: string;
-}> {
-  const rows = db
-    .prepare(
-      `SELECT proposal_id, launchpad, mode, status, signature, mint, error, created_at
-       FROM launch_attempts
-       ORDER BY id DESC
-       LIMIT ?`
-    )
-    .all(limit) as Record<string, unknown>[];
-  return rows.map((row) => ({
+}>> {
+  await databaseReady;
+  const result = await pool.query(
+    `SELECT proposal_id, launchpad, mode, status, signature, mint, error, created_at
+     FROM launch_attempts ORDER BY id DESC LIMIT $1`,
+    [limit]
+  );
+  return result.rows.map((row) => ({
     proposalId: Number(row.proposal_id),
     launchpad: String(row.launchpad),
     mode: String(row.mode),
@@ -463,11 +457,11 @@ export function recentLaunchAttempts(limit = 8): Array<{
     signature: row.signature ? String(row.signature) : undefined,
     mint: row.mint ? String(row.mint) : undefined,
     error: row.error ? String(row.error) : undefined,
-    createdAt: String(row.created_at)
+    createdAt: asIso(row.created_at)
   }));
 }
 
-function mapLaunchJob(row: Record<string, unknown>): LaunchJob {
+function mapLaunchJob(row: QueryResultRow): LaunchJob {
   return {
     id: Number(row.id),
     proposalId: Number(row.proposal_id),
@@ -481,175 +475,208 @@ function mapLaunchJob(row: Record<string, unknown>): LaunchJob {
     lastError: row.last_error ? String(row.last_error) : undefined,
     signature: row.signature ? String(row.signature) : undefined,
     mint: row.mint ? String(row.mint) : undefined,
-    createdAt: String(row.created_at),
-    runAfter: String(row.run_after),
-    startedAt: row.started_at ? String(row.started_at) : undefined,
-    completedAt: row.completed_at ? String(row.completed_at) : undefined
+    createdAt: asIso(row.created_at),
+    runAfter: asIso(row.run_after),
+    startedAt: row.started_at ? asIso(row.started_at) : undefined,
+    completedAt: row.completed_at ? asIso(row.completed_at) : undefined
   };
 }
 
-export function enqueueLaunchJob(input: LaunchJobInput): LaunchJob {
-  const existing = db
-    .prepare(
+export async function enqueueLaunchJob(input: LaunchJobInput): Promise<LaunchJob> {
+  await databaseReady;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const existing = await client.query(
       `SELECT * FROM launch_jobs
-       WHERE proposal_id = ? AND mode = ? AND status IN ('queued', 'running')
-       ORDER BY id DESC
-       LIMIT 1`
-    )
-    .get(input.proposalId, input.mode) as Record<string, unknown> | undefined;
-  if (existing) return mapLaunchJob(existing);
-
-  const now = new Date().toISOString();
-  const result = db
-    .prepare(
+       WHERE proposal_id = $1 AND mode = $2 AND status IN ('queued', 'running')
+       ORDER BY id DESC LIMIT 1 FOR UPDATE`,
+      [input.proposalId, input.mode]
+    );
+    if (existing.rows[0]) {
+      await client.query("COMMIT");
+      return mapLaunchJob(existing.rows[0]);
+    }
+    const inserted = await client.query(
       `INSERT INTO launch_jobs (
         proposal_id, launchpad, mode, chat_id, actor_id, actor_username, created_at, run_after
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      input.proposalId,
-      input.launchpad,
-      input.mode,
-      input.chatId,
-      input.actorId ?? null,
-      input.actorUsername ?? null,
-      now,
-      now
+      ) VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW()) RETURNING *`,
+      [input.proposalId, input.launchpad, input.mode, input.chatId, input.actorId ?? null, input.actorUsername ?? null]
     );
-  const job = getLaunchJob(Number(result.lastInsertRowid));
-  if (!job) throw new Error("Failed to read launch job after insert.");
-  return job;
+    await client.query("COMMIT");
+    return mapLaunchJob(inserted.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    if (isUniqueViolation(error)) {
+      const existing = await getActiveLaunchJob(input.proposalId, input.mode);
+      if (existing) return existing;
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
-export function getLaunchJob(id: number): LaunchJob | undefined {
-  const row = db.prepare("SELECT * FROM launch_jobs WHERE id = ?").get(id) as Record<string, unknown> | undefined;
-  return row ? mapLaunchJob(row) : undefined;
+export async function getLaunchJob(id: number): Promise<LaunchJob | undefined> {
+  await databaseReady;
+  const result = await pool.query("SELECT * FROM launch_jobs WHERE id = $1", [id]);
+  return result.rows[0] ? mapLaunchJob(result.rows[0]) : undefined;
 }
 
-export function claimNextLaunchJob(maxAttempts: number): LaunchJob | undefined {
-  return db.transaction(() => {
-    const now = new Date().toISOString();
-    db.prepare(
+async function getActiveLaunchJob(proposalId: number, mode: LaunchJob["mode"]): Promise<LaunchJob | undefined> {
+  const result = await pool.query(
+    `SELECT * FROM launch_jobs
+     WHERE proposal_id = $1 AND mode = $2 AND status IN ('queued', 'running')
+     ORDER BY id DESC LIMIT 1`,
+    [proposalId, mode]
+  );
+  return result.rows[0] ? mapLaunchJob(result.rows[0]) : undefined;
+}
+
+export async function claimNextLaunchJob(maxAttempts: number): Promise<LaunchJob | undefined> {
+  await databaseReady;
+  return withTransaction(async (client) => {
+    await client.query(
+      `UPDATE launch_jobs SET status = 'queued', started_at = NULL
+       WHERE status = 'running' AND started_at < NOW() - INTERVAL '15 minutes'`
+    );
+    const result = await client.query(
+      `SELECT * FROM launch_jobs
+       WHERE status = 'queued' AND run_after <= NOW() AND attempts < $1
+       ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED`,
+      [maxAttempts]
+    );
+    if (!result.rows[0]) return undefined;
+    const claimed = await client.query(
       `UPDATE launch_jobs
-       SET status = 'queued', started_at = NULL
-       WHERE status = 'running' AND started_at < ?`
-    ).run(new Date(Date.now() - 15 * 60 * 1000).toISOString());
-
-    const row = db
-      .prepare(
-        `SELECT * FROM launch_jobs
-         WHERE status = 'queued' AND run_after <= ? AND attempts < ?
-         ORDER BY id ASC
-         LIMIT 1`
-      )
-      .get(now, maxAttempts) as Record<string, unknown> | undefined;
-    if (!row) return undefined;
-
-    db.prepare(
-      `UPDATE launch_jobs
-       SET status = 'running', attempts = attempts + 1, started_at = ?
-       WHERE id = ? AND status = 'queued'`
-    ).run(now, row.id);
-
-    return getLaunchJob(Number(row.id));
-  })();
+       SET status = 'running', attempts = attempts + 1, started_at = NOW()
+       WHERE id = $1 AND status = 'queued' RETURNING *`,
+      [result.rows[0].id]
+    );
+    return claimed.rows[0] ? mapLaunchJob(claimed.rows[0]) : undefined;
+  });
 }
 
-export function completeLaunchJob(id: number, signature?: string, mint?: string): void {
-  db.prepare(
-    `UPDATE launch_jobs
-     SET status = 'success', signature = ?, mint = ?, completed_at = ?
-     WHERE id = ?`
-  ).run(signature ?? null, mint ?? null, new Date().toISOString(), id);
-}
-
-export function failLaunchJob(id: number, error: string, retryDelayMs: number, maxAttempts: number): void {
-  const job = getLaunchJob(id);
-  if (!job) return;
-  const willRetry = job.attempts < maxAttempts;
-  db.prepare(
-    `UPDATE launch_jobs
-     SET status = ?, last_error = ?, run_after = ?, completed_at = CASE WHEN ? THEN NULL ELSE ? END
-     WHERE id = ?`
-  ).run(
-    willRetry ? "queued" : "failed",
-    error,
-    new Date(Date.now() + retryDelayMs).toISOString(),
-    willRetry ? 1 : 0,
-    new Date().toISOString(),
-    id
+export async function completeLaunchJob(id: number, signature?: string, mint?: string): Promise<void> {
+  await databaseReady;
+  await pool.query(
+    `UPDATE launch_jobs SET status = 'success', signature = $1, mint = $2, completed_at = NOW() WHERE id = $3`,
+    [signature ?? null, mint ?? null, id]
   );
 }
 
-export function recentLaunchJobs(limit = 8): LaunchJob[] {
-  const rows = db
-    .prepare("SELECT * FROM launch_jobs ORDER BY id DESC LIMIT ?")
-    .all(limit) as Record<string, unknown>[];
-  return rows.map(mapLaunchJob);
+export async function failLaunchJob(id: number, error: string, retryDelayMs: number, maxAttempts: number): Promise<void> {
+  await databaseReady;
+  const job = await getLaunchJob(id);
+  if (!job) return;
+  const willRetry = job.attempts < maxAttempts;
+  await pool.query(
+    `UPDATE launch_jobs
+     SET status = $1, last_error = $2, run_after = $3, completed_at = $4
+     WHERE id = $5`,
+    [
+      willRetry ? "queued" : "failed",
+      error,
+      new Date(Date.now() + retryDelayMs),
+      willRetry ? null : new Date(),
+      id
+    ]
+  );
 }
 
-export function consumeVanityMint(suffix: string, proposalId: number): VanityMint | undefined {
-  const normalizedSuffix = suffix;
-  const now = new Date().toISOString();
+export async function recentLaunchJobs(limit = 8): Promise<LaunchJob[]> {
+  await databaseReady;
+  const result = await pool.query("SELECT * FROM launch_jobs ORDER BY id DESC LIMIT $1", [limit]);
+  return result.rows.map(mapLaunchJob);
+}
 
-  return db.transaction(() => {
-    const row = db
-      .prepare(
-        `SELECT * FROM vanity_mints
-         WHERE status = 'available' AND suffix = ?
-         ORDER BY id ASC
-         LIMIT 1`
-      )
-      .get(normalizedSuffix) as Record<string, unknown> | undefined;
-
+export async function consumeVanityMint(suffix: string, proposalId: number): Promise<VanityMint | undefined> {
+  await databaseReady;
+  return withTransaction(async (client) => {
+    const result = await client.query(
+      `SELECT * FROM vanity_mints
+       WHERE status = 'available' AND suffix = $1
+       ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED`,
+      [suffix]
+    );
+    const row = result.rows[0];
     if (!row) return undefined;
-
-    db.prepare(
+    const reserved = await client.query(
       `UPDATE vanity_mints
-       SET status = 'reserved', reserved_at = ?, proposal_id = ?
-       WHERE id = ?`
-    ).run(now, proposalId, row.id);
-
-    return {
-      id: Number(row.id),
-      suffix: String(row.suffix),
-      address: String(row.address),
-      secretKeyBase58: String(row.secret_key_base58)
-    };
-  })();
+       SET status = 'reserved', reserved_at = NOW(), proposal_id = $1
+       WHERE id = $2 AND status = 'available' RETURNING *`,
+      [proposalId, row.id]
+    );
+    if (!reserved.rows[0]) return undefined;
+    return mapVanityMint(reserved.rows[0]);
+  });
 }
 
-export function markVanityMintUsed(id: number): void {
-  db.prepare("UPDATE vanity_mints SET status = 'used', used_at = ? WHERE id = ?").run(new Date().toISOString(), id);
+export async function markVanityMintUsed(id: number): Promise<void> {
+  await databaseReady;
+  await pool.query("UPDATE vanity_mints SET status = 'used', used_at = NOW() WHERE id = $1", [id]);
 }
 
-export function releaseVanityMint(id: number): void {
-  db.prepare(
+export async function releaseVanityMint(id: number): Promise<void> {
+  await databaseReady;
+  await pool.query(
     `UPDATE vanity_mints
      SET status = 'available', reserved_at = NULL, proposal_id = NULL
-     WHERE id = ? AND status = 'reserved'`
-  ).run(id);
+     WHERE id = $1 AND status = 'reserved'`,
+    [id]
+  );
 }
 
-export function countAvailableVanityMints(suffix: string): number {
-  const row = db
-    .prepare("SELECT COUNT(*) AS count FROM vanity_mints WHERE status = 'available' AND suffix = ?")
-    .get(suffix) as { count: number };
-  return Number(row.count);
+export async function countAvailableVanityMints(suffix: string): Promise<number> {
+  await databaseReady;
+  const result = await pool.query(
+    "SELECT COUNT(*) AS count FROM vanity_mints WHERE status = 'available' AND suffix = $1",
+    [suffix]
+  );
+  return Number(result.rows[0].count);
 }
 
-export function quarantineInexactVanityMints(suffix: string): number {
-  const rows = db
-    .prepare("SELECT id, address FROM vanity_mints WHERE status = 'available' AND suffix = ?")
-    .all(suffix) as Array<{ id: number; address: string }>;
-  const badIds = rows.filter((row) => !row.address.endsWith(suffix)).map((row) => row.id);
-
+export async function quarantineInexactVanityMints(suffix: string): Promise<number> {
+  await databaseReady;
+  const result = await pool.query(
+    "SELECT id, address FROM vanity_mints WHERE status = 'available' AND suffix = $1",
+    [suffix]
+  );
+  const badIds = result.rows.filter((row) => !String(row.address).endsWith(suffix)).map((row) => Number(row.id));
   if (badIds.length === 0) return 0;
-
-  const update = db.prepare("UPDATE vanity_mints SET status = 'invalid' WHERE id = ?");
-  db.transaction(() => {
-    for (const id of badIds) update.run(id);
-  })();
-
+  await pool.query("UPDATE vanity_mints SET status = 'invalid' WHERE id = ANY($1::bigint[])", [badIds]);
   return badIds.length;
+}
+
+function mapVanityMint(row: QueryResultRow): VanityMint {
+  return {
+    id: Number(row.id),
+    suffix: String(row.suffix),
+    address: String(row.address),
+    secretKeyBase58: String(row.secret_key_base58)
+  };
+}
+
+async function withTransaction<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await run(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function asIso(value: unknown): string {
+  if (value instanceof Date) return value.toISOString();
+  return new Date(String(value)).toISOString();
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "23505";
 }

@@ -25,7 +25,9 @@ import {
   rejectProposal,
   listWallets,
   updateProposalCashback,
-  updateProposalFeeShares
+  updateProposalFeeShares,
+  assertDatabaseReady,
+  closeDatabase
 } from "./db.js";
 import { launchProposal } from "./launchpads/index.js";
 import { launchWithBags } from "./launchpads/bags.js";
@@ -81,6 +83,7 @@ const rejectionDrafts = new Map<string, RejectionDraft>();
 const activeLaunches = new Set<string>();
 const rateBuckets = new Map<string, { count: number; resetAt: number }>();
 const startedAt = new Date();
+let databaseHealthy = false;
 let launchJobWorkerBusy = false;
 
 type DraftStep =
@@ -197,7 +200,7 @@ bot.command("groupbalance", async (ctx) => {
     return ctx.reply("Use this command inside a Telegram group.");
   }
 
-  const wallet = getWalletSummary("group_portal", String(ctx.chat.id));
+  const wallet = await getWalletSummary("group_portal", String(ctx.chat.id));
   if (!wallet) return ctx.reply("No group wallet yet. An admin can create one with /groupwallet.");
 
   try {
@@ -226,7 +229,7 @@ bot.command("rhgroupbalance", async (ctx) => {
     return ctx.reply("Use this command inside a Telegram group.");
   }
 
-  const wallet = getWalletSummary("group_evm", String(ctx.chat.id));
+  const wallet = await getWalletSummary("group_evm", String(ctx.chat.id));
   if (!wallet) return ctx.reply("No Robinhood group wallet yet. An admin can create one with /rhgroupwallet.");
 
   try {
@@ -250,7 +253,7 @@ bot.command("mywallet", async (ctx) => {
 bot.command("mybalance", async (ctx) => {
   if (!ctx.from) return ctx.reply("I could not identify you.");
 
-  const wallet = getWalletSummary("user", String(ctx.from.id));
+  const wallet = await getWalletSummary("user", String(ctx.from.id));
   if (!wallet) return ctx.reply("No personal wallet yet. Create one with /mywallet.");
 
   try {
@@ -274,7 +277,7 @@ bot.command("rhmywallet", async (ctx) => {
 bot.command("rhmybalance", async (ctx) => {
   if (!ctx.from) return ctx.reply("I could not identify you.");
 
-  const wallet = getWalletSummary("user_evm", String(ctx.from.id));
+  const wallet = await getWalletSummary("user_evm", String(ctx.from.id));
   if (!wallet) return ctx.reply("No Robinhood personal wallet yet. Create one with /rhmywallet.");
 
   try {
@@ -290,7 +293,7 @@ bot.command("exportmywallet", async (ctx) => {
   if (!ctx.from) return ctx.reply("I could not identify you.");
 
   try {
-    const exported = exportWalletSecretBase58("user", String(ctx.from.id));
+    const exported = await exportWalletSecretBase58("user", String(ctx.from.id));
     audit(ctx, "wallet_export_user", undefined, { address: exported.address });
     return ctx.reply(exportMessage("Personal Wallet Export", exported.address, exported.secretKey), telegramReplyOptions);
   } catch (error) {
@@ -304,7 +307,7 @@ bot.command("exportgroupwallet", async (ctx) => {
 
   const [, groupId] = ctx.message.text.split(/\s+/, 2);
   if (!groupId) {
-    const wallets = listWallets("group_portal");
+    const wallets = await listWallets("group_portal");
     if (wallets.length === 0) return ctx.reply("No group wallets found yet. Create one in a group with /groupwallet.");
 
     return ctx.reply(
@@ -324,7 +327,7 @@ bot.command("exportgroupwallet", async (ctx) => {
   }
 
   try {
-    const exported = exportPumpPortalWallet("group", groupId);
+    const exported = await exportPumpPortalWallet("group", groupId);
     audit(ctx, "wallet_export_group", undefined, { groupId, address: exported.address });
     return ctx.reply(
       exportMessage(`Group PumpPortal Wallet Export ${groupId}`, exported.address, exported.secretKey, exported.apiKey),
@@ -346,13 +349,13 @@ bot.action(/^export_group_wallet:(\d+)$/, async (ctx) => {
   }
 
   const walletId = Number(ctx.match[1]);
-  const wallet = listWallets("group_portal").find((item) => item.id === walletId);
+  const wallet = (await listWallets("group_portal")).find((item) => item.id === walletId);
   if (!wallet) {
     await safeAnswerCallback(ctx, "Wallet not found.");
     return;
   }
 
-  const exported = exportPumpPortalWallet("group", wallet.scopeId);
+  const exported = await exportPumpPortalWallet("group", wallet.scopeId);
   audit(ctx, "wallet_export_group", undefined, { groupId: wallet.scopeId, address: exported.address });
   await safeAnswerCallback(ctx, "Exported.");
   await ctx.reply(
@@ -372,7 +375,7 @@ bot.command("idea", async (ctx) => {
     }
 
     const idea = parseIdea(ctx.message.text);
-    const proposal = createProposal(idea, from.id, from.username);
+    const proposal = await createProposal(idea, from.id, from.username);
 
     await ctx.reply(proposalMessage(proposal, "Proposal Submitted"), {
       ...telegramReplyOptions,
@@ -457,7 +460,7 @@ bot.on("photo", async (ctx, next) => {
 bot.command("review", async (ctx) => {
   if (!(await isBotAdmin(ctx))) return ctx.reply("Admin command only.");
 
-  const proposals = listPendingProposals();
+  const proposals = await listPendingProposals();
   if (proposals.length === 0) return ctx.reply("No pending proposals.");
 
   for (const proposal of proposals) {
@@ -474,7 +477,7 @@ bot.command("proposal", async (ctx) => {
   const id = parseIdArg(ctx.message.text);
   if (!id) return ctx.reply("Usage: /proposal <proposal_id>");
 
-  const proposal = getProposal(id);
+  const proposal = await getProposal(id);
   if (!proposal) return ctx.reply(`Proposal #${id} not found.`);
 
   const imageStatus = proposal.image
@@ -501,7 +504,7 @@ bot.command("imagetest", async (ctx) => {
   const id = parseIdArg(ctx.message.text);
   if (!id) return ctx.reply("Usage: /imagetest <proposal_id>");
 
-  const proposal = getProposal(id);
+  const proposal = await getProposal(id);
   if (!proposal) return ctx.reply(`Proposal #${id} not found.`);
 
   try {
@@ -551,14 +554,15 @@ bot.command("localprobe", async (ctx) => {
     return ctx.reply("Amount must be a positive SOL number, like 0.0001.");
   }
 
-  const proposal = getProposal(id);
+  const proposal = await getProposal(id);
   if (!proposal) return ctx.reply(`Proposal #${id} not found.`);
 
   try {
-    const signer =
+    const signer = await (
       walletMode.toLowerCase() === "me"
         ? getWalletSecretBase58("user", String(ctx.from?.id))
-        : getWalletSecretBase58("group", String(ctx.chat?.id));
+        : getWalletSecretBase58("group", String(ctx.chat?.id))
+    );
     const result = await probePumpPortalLocalCreate(proposal, signer.address, amountOverride);
     return ctx.reply(
       [
@@ -584,14 +588,14 @@ bot.command("approve", async (ctx) => {
   const id = parseIdArg(ctx.message.text);
   if (!id) return ctx.reply("Usage: /approve <proposal_id>");
 
-  const pendingProposal = getProposal(id);
+  const pendingProposal = await getProposal(id);
   if (!pendingProposal) return ctx.reply(`Proposal #${id} not found.`);
   if (!pendingProposal.image) {
     return ctx.reply(`Proposal #${id} has no image. Reject it or ask for a new proposal with an image.`);
   }
 
   await assertApprovalImageValid(pendingProposal);
-  const proposal = approveProposal(id, ctx.from.id);
+  const proposal = await approveProposal(id, ctx.from.id);
   if (!proposal) return ctx.reply(`Proposal #${id} not found.`);
   if (proposal.status !== "approved") return ctx.reply(`Proposal #${id} is ${proposal.status}.`);
   audit(ctx, "proposal_approved", id, { launchpad: proposal.launchpad, devBuySol: proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL });
@@ -609,7 +613,7 @@ bot.command("reject", async (ctx) => {
     return ctx.reply("Usage: /reject <proposal_id> <reason>");
   }
 
-  const proposal = rejectProposal(id, reason);
+  const proposal = await rejectProposal(id, reason);
   if (!proposal) return ctx.reply(`Proposal #${id} not found.`);
   audit(ctx, "proposal_rejected", id, { reason });
 
@@ -649,7 +653,7 @@ bot.command("launchme", async (ctx) => {
 bot.command("feesettings", async (ctx) => {
   const id = parseIdArg(ctx.message.text);
   if (!id) return ctx.reply("Usage: /feesettings <proposal_id>");
-  const proposal = getProposal(id);
+  const proposal = await getProposal(id);
   if (!proposal) return ctx.reply(`Proposal #${id} not found.`);
   return ctx.reply(feeSettingsMessage(proposal), telegramReplyOptions);
 });
@@ -658,12 +662,12 @@ bot.command("cashback", async (ctx) => {
   const [, idText, value] = ctx.message.text.split(/\s+/, 3);
   const id = Number(idText);
   if (!Number.isInteger(id) || id <= 0 || !value) return ctx.reply("Usage: /cashback <proposal_id> on|off");
-  const proposal = getProposal(id);
+  const proposal = await getProposal(id);
   if (!proposal) return ctx.reply(`Proposal #${id} not found.`);
   if (!(await canEditProposalSettings(ctx, proposal))) return ctx.reply("Only the proposal creator or an admin can edit this.");
   if (proposal.launchpad !== "pumpfun") return ctx.reply("Cashback only applies to Pump.fun proposals.");
   const enabled = parseOnOff(value);
-  const updated = updateProposalCashback(id, enabled);
+  const updated = await updateProposalCashback(id, enabled);
   audit(ctx, "cashback_updated", id, { enabled });
   return ctx.reply(feeSettingsMessage(updated ?? proposal), telegramReplyOptions);
 });
@@ -675,12 +679,12 @@ bot.command("setfees", async (ctx) => {
   if (!Number.isInteger(id) || id <= 0 || !value) {
     return ctx.reply("Usage: /setfees <proposal_id> none|creator|wallet:bps,wallet:bps");
   }
-  const proposal = getProposal(id);
+  const proposal = await getProposal(id);
   if (!proposal) return ctx.reply(`Proposal #${id} not found.`);
   if (!(await canEditProposalSettings(ctx, proposal))) return ctx.reply("Only the proposal creator or an admin can edit this.");
   if (proposal.launchpad !== "pumpfun") return ctx.reply("Fee sharing only applies to Pump.fun proposals.");
   const feeShares = normalizeFeeShareSetting(value);
-  const updated = updateProposalFeeShares(id, feeShares);
+  const updated = await updateProposalFeeShares(id, feeShares);
   audit(ctx, "fee_shares_updated", id, { feeShares });
   return ctx.reply(feeSettingsMessage(updated ?? proposal), telegramReplyOptions);
 });
@@ -693,7 +697,7 @@ bot.command("launchcheck", async (ctx) => {
       : undefined;
   const robinhoodGroupWallet =
     ctx.chat?.type === "group" || ctx.chat?.type === "supergroup"
-      ? getWalletSummary("group_evm", String(ctx.chat.id))
+      ? await getWalletSummary("group_evm", String(ctx.chat.id))
       : undefined;
 
   const lines = [
@@ -730,10 +734,10 @@ bot.command("launchcheck", async (ctx) => {
     `Pump.fun mint pool target: <b>${config.PUMP_MINT_POOL_SIZE.toLocaleString()}</b>`,
     `Pump.fun mint workers: <b>${config.PUMP_MINT_WORKERS.toLocaleString()}</b>`,
     config.PUMP_MINT_SUFFIX
-      ? `Pump.fun vanity mints ready: <b>${countAvailableVanityMints(config.PUMP_MINT_SUFFIX).toLocaleString()}</b>`
+      ? `Pump.fun vanity mints ready: <b>${(await countAvailableVanityMints(config.PUMP_MINT_SUFFIX)).toLocaleString()}</b>`
       : undefined,
     config.BONK_MINT_SUFFIX
-      ? `Bonk vanity mints ready: <b>${countAvailableVanityMints(config.BONK_MINT_SUFFIX).toLocaleString()}</b>`
+      ? `Bonk vanity mints ready: <b>${(await countAvailableVanityMints(config.BONK_MINT_SUFFIX)).toLocaleString()}</b>`
       : undefined,
     `Bags mint suffix: <b>${config.BAGS_MINT_SUFFIX || "none"}</b>`,
     ctx.chat?.type === "group" || ctx.chat?.type === "supergroup" ? "" : undefined,
@@ -761,8 +765,8 @@ bot.command("launchcheck", async (ctx) => {
 
 bot.command("status", async (ctx) => {
   if (!(await isBotAdmin(ctx))) return ctx.reply("Admin command only.");
-  const attempts = recentLaunchAttempts(6);
-  const jobs = recentLaunchJobs(6);
+  const attempts = await recentLaunchAttempts(6);
+  const jobs = await recentLaunchJobs(6);
   const uptimeSeconds = Math.floor((Date.now() - startedAt.getTime()) / 1000);
   const lines = [
     "<b>Bot Status</b>",
@@ -806,7 +810,7 @@ bot.command("vanityclean", async (ctx) => {
   if (!(await isBotAdmin(ctx))) return ctx.reply("Admin command only.");
   if (!config.PUMP_MINT_SUFFIX) return ctx.reply("No PUMP_MINT_SUFFIX configured.");
 
-  const count = quarantineInexactVanityMints(config.PUMP_MINT_SUFFIX);
+  const count = await quarantineInexactVanityMints(config.PUMP_MINT_SUFFIX);
   return ctx.reply(
     `Quarantined ${count.toLocaleString()} pooled mints that do not exactly end with <code>${escapeHtml(
       config.PUMP_MINT_SUFFIX
@@ -822,7 +826,7 @@ bot.action(/^approve:(\d+)$/, async (ctx) => {
   }
 
   const id = Number(ctx.match[1]);
-  const pendingProposal = getProposal(id);
+  const pendingProposal = await getProposal(id);
   if (!pendingProposal) {
     await ctx.answerCbQuery("Proposal not found.");
     return;
@@ -866,7 +870,7 @@ bot.action(/^confirm_launch:(api|group|personal):(\d+)$/, async (ctx) => {
     return;
   }
 
-  const proposal = getProposal(id);
+  const proposal = await getProposal(id);
   if (!proposal) {
     await safeAnswerCallback(ctx, "Proposal not found.");
     return;
@@ -876,7 +880,7 @@ bot.action(/^confirm_launch:(api|group|personal):(\d+)$/, async (ctx) => {
     return;
   }
 
-  const job = enqueueLaunchJob({
+  const job = await enqueueLaunchJob({
     proposalId: proposal.id,
     launchpad: proposal.launchpad,
     mode,
@@ -899,17 +903,17 @@ bot.action(/^cancel_launch:(\d+)$/, async (ctx) => {
 });
 
 bot.action(/^cashback_toggle:(\d+)$/, async (ctx) => {
-  const proposal = getProposal(Number(ctx.match[1]));
+  const proposal = await getProposal(Number(ctx.match[1]));
   if (!proposal) return safeAnswerCallback(ctx, "Proposal not found.");
   if (!(await canEditProposalSettings(ctx, proposal))) return safeAnswerCallback(ctx, "Creator or admin only.");
-  const updated = updateProposalCashback(proposal.id, !proposal.pumpfunCashback);
+  const updated = await updateProposalCashback(proposal.id, !proposal.pumpfunCashback);
   audit(ctx, "cashback_updated", proposal.id, { enabled: updated?.pumpfunCashback ?? !proposal.pumpfunCashback });
   await safeAnswerCallback(ctx, updated?.pumpfunCashback ? "Cashback enabled." : "Cashback disabled.");
   await ctx.reply(feeSettingsMessage(updated ?? proposal), telegramReplyOptions);
 });
 
 bot.action(/^fees_menu:(\d+)$/, async (ctx) => {
-  const proposal = getProposal(Number(ctx.match[1]));
+  const proposal = await getProposal(Number(ctx.match[1]));
   if (!proposal) return safeAnswerCallback(ctx, "Proposal not found.");
   if (!(await canEditProposalSettings(ctx, proposal))) return safeAnswerCallback(ctx, "Creator or admin only.");
   await safeAnswerCallback(ctx, "Fee settings.");
@@ -934,7 +938,7 @@ bot.action(/^fees_menu:(\d+)$/, async (ctx) => {
 });
 
 bot.action(/^fees_custom_prompt:(\d+)$/, async (ctx) => {
-  const proposal = getProposal(Number(ctx.match[1]));
+  const proposal = await getProposal(Number(ctx.match[1]));
   if (!proposal) return safeAnswerCallback(ctx, "Proposal not found.");
   if (!(await canEditProposalSettings(ctx, proposal))) return safeAnswerCallback(ctx, "Creator or admin only.");
 
@@ -956,10 +960,10 @@ bot.action(/^fees_custom_prompt:(\d+)$/, async (ctx) => {
 });
 
 bot.action(/^fees_set:(\d+):(.+)$/, async (ctx) => {
-  const proposal = getProposal(Number(ctx.match[1]));
+  const proposal = await getProposal(Number(ctx.match[1]));
   if (!proposal) return safeAnswerCallback(ctx, "Proposal not found.");
   if (!(await canEditProposalSettings(ctx, proposal))) return safeAnswerCallback(ctx, "Creator or admin only.");
-  const updated = updateProposalFeeShares(proposal.id, normalizeFeeShareSetting(ctx.match[2]));
+  const updated = await updateProposalFeeShares(proposal.id, normalizeFeeShareSetting(ctx.match[2]));
   audit(ctx, "fee_shares_updated", proposal.id, { feeShares: updated?.pumpfunFeeShares });
   await safeAnswerCallback(ctx, "Fee settings updated.");
   await ctx.reply(feeSettingsMessage(updated ?? proposal), telegramReplyOptions);
@@ -972,7 +976,7 @@ bot.action(/^reject_prompt:(\d+)$/, async (ctx) => {
   }
 
   const proposalId = Number(ctx.match[1]);
-  const proposal = getProposal(proposalId);
+  const proposal = await getProposal(proposalId);
   if (!proposal) {
     await safeAnswerCallback(ctx, "Proposal not found.");
     return;
@@ -1101,7 +1105,7 @@ bot.action(/^wizard:(.+)$/, async (ctx) => {
     if (action === "submit") {
       const idea = validateIdea(draft.data);
       if (!ctx.from) throw new Error("I could not identify the sender.");
-      const proposal = createProposal(idea, ctx.from.id, ctx.from.username);
+      const proposal = await createProposal(idea, ctx.from.id, ctx.from.username);
       drafts.delete(key);
       await ctx.answerCbQuery("Submitted.");
       await ctx.editMessageText(proposalMessage(proposal, "Proposal Submitted"), {
@@ -1124,7 +1128,7 @@ bot.catch((error, ctx) => {
 });
 
 async function runApiLaunch(ctx: Context, id: number): Promise<void> {
-  const proposal = getProposal(id);
+  const proposal = await getProposal(id);
   if (!proposal) return void (await ctx.reply(`Proposal #${id} not found.`));
   if (proposal.status !== "approved") {
     return void (await ctx.reply(`Proposal #${id} must be approved before API launch. Current status: ${proposal.status}.`));
@@ -1142,7 +1146,7 @@ async function runApiLaunch(ctx: Context, id: number): Promise<void> {
       telegramReplyOptions
     );
 
-    const attemptId = createLaunchAttempt({
+    const attemptId = await createLaunchAttempt({
       proposalId: proposal.id,
       launchpad: proposal.launchpad,
       mode: "api",
@@ -1152,16 +1156,16 @@ async function runApiLaunch(ctx: Context, id: number): Promise<void> {
     let result: LaunchResult;
     try {
       result = await launchProposal(proposal);
-      finishLaunchAttempt(attemptId, {
+      await finishLaunchAttempt(attemptId, {
         status: result.dryRun ? "success" : "success",
         signature: result.signature,
         mint: result.mint
       });
     } catch (error) {
-      finishLaunchAttempt(attemptId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
+      await finishLaunchAttempt(attemptId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
       throw error;
     }
-    if (!result.dryRun) markLaunched(id, result.signature);
+    if (!result.dryRun) await markLaunched(id, result.signature);
     audit(ctx, "launch_api", id, { signature: result.signature, mint: result.mint });
     await safeDeleteMessage(ctx, progressMessage.message_id, "API launch progress");
     await replyLaunchResult(ctx, result);
@@ -1169,7 +1173,7 @@ async function runApiLaunch(ctx: Context, id: number): Promise<void> {
 }
 
 async function sendLaunchConfirmation(ctx: Context, mode: LaunchMode, id: number): Promise<void> {
-  const proposal = getProposal(id);
+  const proposal = await getProposal(id);
   if (!proposal) return void (await ctx.reply(`Proposal #${id} not found.`));
   if (proposal.launchpad === "robinhood") {
     const devBuyEth = proposal.devBuyEth ?? config.DEFAULT_DEV_BUY_ETH;
@@ -1247,7 +1251,7 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
   }
   const chatId = ctx.chat.id;
 
-  const proposal = getProposal(id);
+  const proposal = await getProposal(id);
   if (!proposal) return void (await ctx.reply(`Proposal #${id} not found.`));
   if (proposal.status !== "approved") {
     return void (await ctx.reply(`Proposal #${id} must be approved before group wallet launch. Current status: ${proposal.status}.`));
@@ -1256,10 +1260,10 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
   await withLaunchLock(ctx, `proposal:${id}`, async () => {
     const robinhoodWallet =
       proposal.launchpad === "robinhood" ? await getOrCreateRobinhoodWallet("group", String(chatId)) : undefined;
-    const wallet = proposal.launchpad === "robinhood" ? undefined : getPumpPortalApiKey("group", String(chatId));
+    const wallet = proposal.launchpad === "robinhood" ? undefined : await getPumpPortalApiKey("group", String(chatId));
     const exportedWallet =
       proposal.launchpad === "pumpfun" || proposal.launchpad === "bonk" || proposal.launchpad === "bags"
-        ? exportPumpPortalWallet("group", String(chatId))
+        ? await exportPumpPortalWallet("group", String(chatId))
         : undefined;
     if (!config.DRY_RUN) {
       await assertGroupLaunchReady(proposal, String(chatId), robinhoodWallet?.address ?? wallet!.address);
@@ -1272,7 +1276,7 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
       telegramReplyOptions
     );
 
-    const attemptId = createLaunchAttempt({
+    const attemptId = await createLaunchAttempt({
       proposalId: proposal.id,
       launchpad: proposal.launchpad,
       mode: "group",
@@ -1293,7 +1297,7 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
         : proposal.launchpad === "robinhood"
           ? await launchWithRobinhoodBags(
               proposal,
-              getRobinhoodWalletSecret("group", String(chatId)).privateKey,
+              (await getRobinhoodWalletSecret("group", String(chatId))).privateKey,
               robinhoodWallet?.address
             )
         : proposal.launchpad === "bags"
@@ -1302,7 +1306,7 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
             ? await launchWithPumpPortalApiKey(proposal, wallet!.apiKey)
             : await launchWithPumpFunSdk(proposal, exportedWallet?.secretKey ?? "", wallet!.address);
     } catch (error) {
-      finishLaunchAttempt(attemptId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
+      await finishLaunchAttempt(attemptId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
       throw error;
     }
     if (!result.dryRun && proposal.launchpad === "bonk" && exportedWallet) {
@@ -1318,8 +1322,8 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
         platformFeeError: platformFee.error
       };
     }
-    if (!result.dryRun) markLaunched(id, result.signature);
-    finishLaunchAttempt(attemptId, { status: "success", signature: result.signature, mint: result.mint });
+    if (!result.dryRun) await markLaunched(id, result.signature);
+    await finishLaunchAttempt(attemptId, { status: "success", signature: result.signature, mint: result.mint });
     audit(ctx, "launch_group", id, { signature: result.signature, mint: result.mint, payerAddress: robinhoodWallet?.address ?? wallet?.address });
     await safeDeleteMessage(ctx, progressMessage.message_id, "group launch progress");
     await replyLaunchResult(ctx, result);
@@ -1332,7 +1336,7 @@ async function runPersonalLaunch(ctx: Context, id: number): Promise<void> {
     return;
   }
 
-  const proposal = getProposal(id);
+  const proposal = await getProposal(id);
   if (!proposal) return void (await ctx.reply(`Proposal #${id} not found.`));
   if (proposal.status === "launched" || proposal.status === "rejected") {
     return void (await ctx.reply(`Proposal #${id} is ${proposal.status}.`));
@@ -1360,7 +1364,7 @@ async function runPersonalLaunch(ctx: Context, id: number): Promise<void> {
       telegramReplyOptions
     );
 
-    const attemptId = createLaunchAttempt({
+    const attemptId = await createLaunchAttempt({
       proposalId: proposal.id,
       launchpad: proposal.launchpad,
       mode: "personal",
@@ -1379,17 +1383,21 @@ async function runPersonalLaunch(ctx: Context, id: number): Promise<void> {
         : proposal.launchpad === "robinhood"
           ? await launchWithRobinhoodBags(
               proposal,
-              getRobinhoodWalletSecret("user", String(ctx.from!.id)).privateKey,
+              (await getRobinhoodWalletSecret("user", String(ctx.from!.id))).privateKey,
               wallet.address
             )
-          : await launchWithPumpFunSdk(proposal, exportWalletSecretBase58("user", String(ctx.from!.id)).secretKey, wallet.address);
-      finishLaunchAttempt(attemptId, { status: "success", signature: result.signature, mint: result.mint });
+          : await launchWithPumpFunSdk(
+              proposal,
+              (await exportWalletSecretBase58("user", String(ctx.from!.id))).secretKey,
+              wallet.address
+            );
+      await finishLaunchAttempt(attemptId, { status: "success", signature: result.signature, mint: result.mint });
     } catch (error) {
-      finishLaunchAttempt(attemptId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
+      await finishLaunchAttempt(attemptId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
       throw error;
     }
 
-    if (!result.dryRun) markLaunched(id, result.signature);
+    if (!result.dryRun) await markLaunched(id, result.signature);
     audit(ctx, "launch_personal", id, { signature: result.signature, mint: result.mint, payerAddress: wallet.address });
     await safeDeleteMessage(ctx, progressMessage.message_id, "personal launch progress");
     await replyLaunchResult(ctx, result);
@@ -1401,7 +1409,7 @@ async function processLaunchJobs(): Promise<void> {
   launchJobWorkerBusy = true;
   try {
     while (true) {
-      const job = claimNextLaunchJob(config.LAUNCH_JOB_MAX_ATTEMPTS);
+      const job = await claimNextLaunchJob(config.LAUNCH_JOB_MAX_ATTEMPTS);
       if (!job) return;
       await executeLaunchJob(job);
     }
@@ -1420,13 +1428,13 @@ async function executeLaunchJob(job: {
 }): Promise<void> {
   const lockKey = job.mode === "personal" ? `personal:${job.actorId}:${job.proposalId}` : `proposal:${job.proposalId}`;
   if (activeLaunches.has(lockKey)) {
-    failLaunchJob(job.id, "Launch is already active; retrying shortly.", config.LAUNCH_JOB_POLL_MS * 2, config.LAUNCH_JOB_MAX_ATTEMPTS);
+    await failLaunchJob(job.id, "Launch is already active; retrying shortly.", config.LAUNCH_JOB_POLL_MS * 2, config.LAUNCH_JOB_MAX_ATTEMPTS);
     return;
   }
 
   activeLaunches.add(lockKey);
   try {
-    const proposal = getProposal(job.proposalId);
+    const proposal = await getProposal(job.proposalId);
     if (!proposal) throw new Error(`Proposal #${job.proposalId} not found.`);
     if (proposal.status !== "approved") throw new Error(`Proposal #${job.proposalId} is ${proposal.status}; expected approved.`);
 
@@ -1435,7 +1443,7 @@ async function executeLaunchJob(job: {
       const wallet =
         proposal.launchpad === "robinhood"
           ? await getOrCreateRobinhoodWallet("group", job.chatId)
-          : getPumpPortalApiKey("group", job.chatId);
+          : await getPumpPortalApiKey("group", job.chatId);
       payerAddress = wallet.address;
       if (!config.DRY_RUN) await assertGroupLaunchReady(proposal, job.chatId, wallet.address);
     } else if (job.mode === "personal") {
@@ -1458,7 +1466,7 @@ async function executeLaunchJob(job: {
       telegramReplyOptions
     );
 
-    const attemptId = createLaunchAttempt({
+    const attemptId = await createLaunchAttempt({
       proposalId: proposal.id,
       launchpad: proposal.launchpad,
       mode: job.mode,
@@ -1470,15 +1478,15 @@ async function executeLaunchJob(job: {
     let result: LaunchResult;
     try {
       result = await runQueuedLaunch(proposal, job.mode, job.chatId, job.actorId);
-      finishLaunchAttempt(attemptId, { status: "success", signature: result.signature, mint: result.mint });
+      await finishLaunchAttempt(attemptId, { status: "success", signature: result.signature, mint: result.mint });
     } catch (error) {
-      finishLaunchAttempt(attemptId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
+      await finishLaunchAttempt(attemptId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
       throw error;
     }
 
-    if (!result.dryRun) markLaunched(job.proposalId, result.signature);
-    completeLaunchJob(job.id, result.signature, result.mint);
-    createAuditLog({
+    if (!result.dryRun) await markLaunched(job.proposalId, result.signature);
+    await completeLaunchJob(job.id, result.signature, result.mint);
+    await createAuditLog({
       action: `launch_job_${job.mode}_success`,
       actorId: job.actorId,
       chatId: job.chatId,
@@ -1494,7 +1502,7 @@ async function executeLaunchJob(job: {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const retryable = isRetryableLaunchJobError(error);
-    failLaunchJob(job.id, message, config.LAUNCH_RETRY_DELAY_MS, retryable ? config.LAUNCH_JOB_MAX_ATTEMPTS : 0);
+    await failLaunchJob(job.id, message, config.LAUNCH_RETRY_DELAY_MS, retryable ? config.LAUNCH_JOB_MAX_ATTEMPTS : 0);
     logError("launch_job_failed", error, { jobId: job.id, proposalId: job.proposalId, mode: job.mode, retryable });
     await bot.telegram.sendMessage(
       job.chatId,
@@ -1528,14 +1536,18 @@ async function runQueuedLaunch(
 
   if (mode === "group") {
     const robinhoodWallet = proposal.launchpad === "robinhood" ? await getOrCreateRobinhoodWallet("group", chatId) : undefined;
-    const wallet = proposal.launchpad === "robinhood" ? undefined : getPumpPortalApiKey("group", chatId);
+    const wallet = proposal.launchpad === "robinhood" ? undefined : await getPumpPortalApiKey("group", chatId);
     const exportedWallet =
       proposal.launchpad === "pumpfun" || proposal.launchpad === "bonk" || proposal.launchpad === "bags"
-        ? exportPumpPortalWallet("group", chatId)
+        ? await exportPumpPortalWallet("group", chatId)
         : undefined;
     let result =
       proposal.launchpad === "robinhood"
-        ? await launchWithRobinhoodBags(proposal, getRobinhoodWalletSecret("group", chatId).privateKey, robinhoodWallet?.address)
+        ? await launchWithRobinhoodBags(
+            proposal,
+            (await getRobinhoodWalletSecret("group", chatId)).privateKey,
+            robinhoodWallet?.address
+          )
         : proposal.launchpad === "bags"
         ? await launchWithBags(proposal, exportedWallet?.secretKey ?? "")
         : proposal.launchpad === "bonk"
@@ -1560,10 +1572,18 @@ async function runQueuedLaunch(
   if (!actorId) throw new Error("Personal launch job is missing actor id.");
   if (proposal.launchpad === "robinhood") {
     const wallet = await getOrCreateRobinhoodWallet("user", String(actorId));
-    return launchWithRobinhoodBags(proposal, getRobinhoodWalletSecret("user", String(actorId)).privateKey, wallet.address);
+    return launchWithRobinhoodBags(
+      proposal,
+      (await getRobinhoodWalletSecret("user", String(actorId))).privateKey,
+      wallet.address
+    );
   }
   const wallet = await getOrCreateWallet("user", String(actorId));
-  return launchWithPumpFunSdk(proposal, exportWalletSecretBase58("user", String(actorId)).secretKey, wallet.address);
+  return launchWithPumpFunSdk(
+    proposal,
+    (await exportWalletSecretBase58("user", String(actorId))).secretKey,
+    wallet.address
+  );
 }
 
 function isRetryableLaunchJobError(error: unknown): boolean {
@@ -1591,7 +1611,7 @@ async function assertGroupLaunchReady(proposal: Proposal, groupId: string, walle
   if (config.MAX_DEV_BUY_SOL > 0 && devBuySol > config.MAX_DEV_BUY_SOL) {
     problems.push(`dev buy ${devBuySol} SOL exceeds MAX_DEV_BUY_SOL ${config.MAX_DEV_BUY_SOL} SOL`);
   }
-  const groupLaunchesToday = config.GROUP_DAILY_LAUNCH_LIMIT > 0 ? countSuccessfulLaunchesSince("chat", groupId, dayAgoIso()) : 0;
+  const groupLaunchesToday = config.GROUP_DAILY_LAUNCH_LIMIT > 0 ? await countSuccessfulLaunchesSince("chat", groupId, dayAgoIso()) : 0;
   if (config.GROUP_DAILY_LAUNCH_LIMIT > 0 && groupLaunchesToday >= config.GROUP_DAILY_LAUNCH_LIMIT) {
     problems.push(`group daily launch limit reached (${groupLaunchesToday}/${config.GROUP_DAILY_LAUNCH_LIMIT})`);
   }
@@ -1605,13 +1625,13 @@ async function assertGroupLaunchReady(proposal: Proposal, groupId: string, walle
     problems.push("Bags vanity suffix is not supported by the current Bags SDK launch flow; set BAGS_MINT_SUFFIX=");
   }
   if (proposal.launchpad === "pumpfun" && !config.PINATA_JWT) problems.push("PINATA_JWT is missing");
-  if (suffix && countAvailableVanityMints(suffix) < 1) {
+  if (suffix && (await countAvailableVanityMints(suffix)) < 1) {
     problems.push(`no ${proposal.launchpad} vanity mints available for suffix "${suffix}"`);
   }
 
   if (proposal.launchpad === "bonk") {
     try {
-      exportPumpPortalWallet("group", groupId);
+      await exportPumpPortalWallet("group", groupId);
     } catch (error) {
       problems.push(error instanceof Error ? error.message : "group wallet export failed");
     }
@@ -1670,7 +1690,7 @@ async function assertPersonalLaunchReady(proposal: Proposal, walletAddress: stri
     problems.push(`dev buy ${devBuySol} SOL exceeds MAX_DEV_BUY_SOL ${config.MAX_DEV_BUY_SOL} SOL`);
   }
   const personalLaunchesToday =
-    config.USER_DAILY_LAUNCH_LIMIT > 0 ? countSuccessfulLaunchesSince("actor", proposal.createdBy, dayAgoIso()) : 0;
+    config.USER_DAILY_LAUNCH_LIMIT > 0 ? await countSuccessfulLaunchesSince("actor", proposal.createdBy, dayAgoIso()) : 0;
   if (config.USER_DAILY_LAUNCH_LIMIT > 0 && personalLaunchesToday >= config.USER_DAILY_LAUNCH_LIMIT) {
     problems.push(`personal daily launch limit reached (${personalLaunchesToday}/${config.USER_DAILY_LAUNCH_LIMIT})`);
   }
@@ -1681,7 +1701,7 @@ async function assertPersonalLaunchReady(proposal: Proposal, walletAddress: stri
     problems.push("PLATFORM_TREASURY_WALLET is not a valid Solana wallet address");
   }
   if (!config.PINATA_JWT) problems.push("PINATA_JWT is missing");
-  if (suffix && countAvailableVanityMints(suffix) < 1) {
+  if (suffix && (await countAvailableVanityMints(suffix)) < 1) {
     problems.push(`no ${proposal.launchpad} vanity mints available for suffix "${suffix}"`);
   }
 
@@ -1803,7 +1823,7 @@ async function assertApiLaunchReady(proposal: Proposal): Promise<void> {
   }
   if (proposal.launchpad === "pumpfun" && !config.PINATA_JWT) problems.push("PINATA_JWT is missing");
   if (!proposal.image) problems.push("proposal has no image");
-  if (suffix && countAvailableVanityMints(suffix) < 1) {
+  if (suffix && (await countAvailableVanityMints(suffix)) < 1) {
     problems.push(`no ${proposal.launchpad} vanity mints available for suffix "${suffix}"`);
   }
 
@@ -1990,7 +2010,7 @@ function validateTelegramPhotoMeta(photo: { width: number; height: number; file_
 }
 
 async function validateAndApproveFromButton(ctx: Context, id: number, adminId: number): Promise<void> {
-  const pendingProposal = getProposal(id);
+  const pendingProposal = await getProposal(id);
   if (!pendingProposal) {
     await ctx.reply(`Proposal #${id} not found.`);
     return;
@@ -2005,7 +2025,7 @@ async function validateAndApproveFromButton(ctx: Context, id: number, adminId: n
   }
 
   await assertApprovalImageValid(pendingProposal);
-  const proposal = approveProposal(id, adminId);
+  const proposal = await approveProposal(id, adminId);
   if (!proposal) {
     await ctx.reply(`Proposal #${id} not found.`);
     return;
@@ -2333,7 +2353,7 @@ async function applyRejectionText(
     throw new Error("Rejection reason must be 2-300 characters.");
   }
 
-  const proposal = rejectProposal(draft.proposalId, reason);
+  const proposal = await rejectProposal(draft.proposalId, reason);
   rejectionDrafts.delete(key);
   await safeDeleteMessage(ctx, draft.promptMessageId, "rejection prompt");
 
@@ -2535,14 +2555,14 @@ function describeUnknownError(error: unknown): string {
 }
 
 function audit(ctx: Context, action: string, proposalId?: number, details?: unknown): void {
-  createAuditLog({
+  void createAuditLog({
     action,
     actorId: ctx.from?.id,
     actorUsername: ctx.from?.username,
     chatId: ctx.chat?.id === undefined ? undefined : String(ctx.chat.id),
     proposalId,
     details
-  });
+  }).catch((error) => logError("audit_persist_failed", error, { action, proposalId }));
   logInfo("audit", { action, proposalId, actorId: ctx.from?.id, chatId: ctx.chat?.id, details });
 }
 
@@ -2567,10 +2587,11 @@ function startHealthServer(): void {
   if (!config.HEALTHCHECK_PORT) return;
 
   const server = http.createServer((_, response) => {
-    response.writeHead(200, { "content-type": "application/json" });
+    response.writeHead(databaseHealthy ? 200 : 503, { "content-type": "application/json" });
     response.end(
       JSON.stringify({
-        ok: true,
+        ok: databaseHealthy,
+        database: databaseHealthy ? "connected" : "starting",
         mode: config.DRY_RUN ? "dry-run" : "live",
         uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
         activeLaunches: activeLaunches.size
@@ -2585,11 +2606,29 @@ function startHealthServer(): void {
 
 console.log("Starting Telegram launchpad bot...");
 startHealthServer();
-setInterval(() => void processLaunchJobs().catch((error) => logError("launch_job_worker_tick_failed", error)), config.LAUNCH_JOB_POLL_MS);
-void launchBotWithRetry();
+void startBot().catch((error) => {
+  logError("bot_startup_failed", error);
+  void closeDatabase().finally(() => process.exit(1));
+});
 
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+process.once("SIGINT", () => void shutdown("SIGINT"));
+process.once("SIGTERM", () => void shutdown("SIGTERM"));
+
+async function startBot(): Promise<void> {
+  await assertDatabaseReady();
+  databaseHealthy = true;
+  logInfo("database_connected", { provider: "postgres" });
+  setInterval(
+    () => void processLaunchJobs().catch((error) => logError("launch_job_worker_tick_failed", error)),
+    config.LAUNCH_JOB_POLL_MS
+  );
+  await launchBotWithRetry();
+}
+
+async function shutdown(signal: "SIGINT" | "SIGTERM"): Promise<void> {
+  bot.stop(signal);
+  await closeDatabase();
+}
 
 async function launchBotWithRetry(): Promise<void> {
   let attempt = 1;

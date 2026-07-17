@@ -1,14 +1,6 @@
 import { spawn } from "node:child_process";
-import path from "node:path";
 
 const suffixes = ["pump", "bonk", "bags"];
-const binaryPath = path.join(
-  "rust",
-  "vanity-worker",
-  "target",
-  "release",
-  process.platform === "win32" ? "vanity-worker.exe" : "vanity-worker"
-);
 
 const build = spawn("cargo", ["build", "--release", "--manifest-path", "rust/vanity-worker/Cargo.toml"], {
   stdio: "inherit",
@@ -28,14 +20,14 @@ const children = [];
 
 function startWorkers() {
   for (const suffix of suffixes) {
-    const child = spawn(binaryPath, [], {
-    env: {
-      ...process.env,
-      VANITY_MINT_SUFFIX: suffix
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-    shell: process.platform === "win32"
-  });
+    const child = spawn(process.execPath, ["scripts/run-vanity-worker.mjs", suffix], {
+      env: {
+        ...process.env,
+        SKIP_VANITY_BUILD: "true"
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+      shell: false
+    });
 
   child.stdout.on("data", (chunk) => process.stdout.write(`[${suffix}] ${chunk}`));
   child.stderr.on("data", (chunk) => process.stderr.write(`[${suffix}] ${chunk}`));

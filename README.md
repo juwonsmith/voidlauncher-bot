@@ -92,10 +92,10 @@ LOG_DIR=./logs
 HEALTHCHECK_PORT=3001
 ```
 
-Every live launch now requires a final spend confirmation button. The bot writes admin actions and launch attempts to SQLite, and writes searchable JSONL logs to `logs/app.jsonl` and `logs/error.jsonl`. Use `/status` for recent launch attempts and uptime.
+Every live launch now requires a final spend confirmation button. The bot writes admin actions, wallets, queued jobs, and launch attempts to Postgres, and writes searchable JSONL logs to `logs/app.jsonl` and `logs/error.jsonl`. Use `/status` for recent launch attempts and uptime.
 Set `MAX_DEV_BUY_SOL`, `GROUP_DAILY_LAUNCH_LIMIT`, or `USER_DAILY_LAUNCH_LIMIT` to `0` to make that control unlimited. `DEFAULT_DEV_BUY_SOL` is only the default wizard value.
 
-Launches confirmed through the bot are stored in a persistent `launch_jobs` queue. If the bot restarts before a queued job runs, it resumes from the database on startup. See `docs/production.md` for the AWS runbook and Postgres scale path.
+Launches confirmed through the bot are stored in a persistent Postgres `launch_jobs` queue. If the bot restarts before a queued job runs, it resumes from the database on startup. See `docs/production.md` for the deployment runbook.
 
 AWS process example with PM2:
 
@@ -113,7 +113,7 @@ Server hygiene:
 
 - Rotate any Telegram token, API key, or private key that was ever pasted into chat.
 - Keep `.env`, `data/`, `logs/`, and wallet backups out of GitHub.
-- Back up `WALLET_ENCRYPTION_KEY` and `data/bot.sqlite`; losing either can make encrypted wallets unrecoverable.
+- Back up `WALLET_ENCRYPTION_KEY` and your Postgres database; losing the encryption key can make encrypted wallets unrecoverable.
 - Use AWS security groups to allow SSH only from your IP. The bot uses Telegram polling, so it does not need public HTTP/HTTPS unless you expose `HEALTHCHECK_PORT`.
 - Add log rotation on AWS, for example `pm2 install pm2-logrotate`.
 

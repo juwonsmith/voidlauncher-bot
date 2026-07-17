@@ -9,6 +9,8 @@
 - Logs are written as JSONL in `logs/app.jsonl` and `logs/error.jsonl`.
 - `/status` shows uptime, queue state, recent jobs, and recent attempts.
 - `/launchcheck` shows operational limits and launch readiness.
+- Postgres is the source of truth for wallets, proposals, audit records, jobs, and launch attempts.
+- Queue workers atomically claim jobs with `FOR UPDATE SKIP LOCKED`.
 
 ## AWS Process
 
@@ -39,10 +41,10 @@ pm2 restart voidlauncher
 Back up these together:
 
 - `.env`
-- `data/bot.sqlite`
-- `data/wallet.key` if the bot generated one
+- your Postgres database
+- `WALLET_ENCRYPTION_KEY`
 
-If `WALLET_ENCRYPTION_KEY` or `data/wallet.key` is lost, encrypted launch wallets may be unrecoverable.
+If `WALLET_ENCRYPTION_KEY` is lost, encrypted launch wallets may be unrecoverable. Store it outside Render as well as in Render's secret environment variables.
 
 ## Secret Rotation Checklist
 
@@ -61,24 +63,8 @@ npm run build
 pm2 restart voidlauncher
 ```
 
-## Database Scale Path
+## Database
 
-Current production beta uses SQLite with WAL mode. That is fine for one AWS instance and one bot process.
-
-Move to Postgres when you need:
-
-- multiple bot/worker instances,
-- hosted backups and point-in-time recovery,
-- analytics across many groups,
-- higher write concurrency,
-- read replicas or external dashboards.
-
-Migration approach:
-
-1. Keep SQLite as the source of truth until traffic is stable.
-2. Create Postgres tables matching `proposals`, `wallets`, `vanity_mints`, `audit_logs`, `launch_attempts`, and `launch_jobs`.
-3. Move DB functions in `src/db.ts` behind a repository interface.
-4. Add a Postgres implementation using transactions with `FOR UPDATE SKIP LOCKED` for `claimNextLaunchJob`.
-5. Run one queue worker first, then scale workers only after idempotency and monitoring are proven.
+Set `DATABASE_URL` to a persistent Postgres connection string. The bot creates and upgrades its schema during startup. To copy a previous local SQLite database into Postgres, stop the bot and run `npm run db:migrate:sqlite` once with both `DATABASE_PATH` and `DATABASE_URL` configured.
 
 Do not run multiple Telegram polling processes with the same token. If scaling horizontally, move Telegram to webhooks behind HTTPS and let only the queue workers scale separately.

@@ -11,6 +11,9 @@ const envSchema = z.object({
     .default("true")
     .transform((value) => value.toLowerCase() !== "false"),
   DATABASE_PATH: z.string().default("./data/bot.sqlite"),
+  DATABASE_URL: z.string().min(1).optional(),
+  DATABASE_POOL_MAX: z.coerce.number().int().positive().default(5),
+  DATABASE_CONNECT_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
   DRY_RUN: z
     .string()
     .default("true")

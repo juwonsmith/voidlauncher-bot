@@ -11,6 +11,7 @@
     "start": "node dist/index.js",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "db:migrate:sqlite": "npm run build && node scripts/migrate-sqlite-to-postgres.mjs",
     "vanity:worker": "cargo run --release --manifest-path rust/vanity-worker/Cargo.toml",
     "vanity:pump": "node scripts/run-vanity-worker.mjs pump",
     "vanity:bonk": "node scripts/run-vanity-worker.mjs bonk",
@@ -25,6 +26,7 @@
     "bn.js": "^5.2.3",
     "bs58": "^6.0.0",
     "dotenv": "^16.4.7",
+    "pg": "^8.22.0",
     "telegraf": "^4.16.3",
     "tweetnacl": "^1.0.3",
     "viem": "^2.55.2",
@@ -33,6 +35,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.5",
+    "@types/pg": "^8.20.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }

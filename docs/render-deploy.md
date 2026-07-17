@@ -4,7 +4,7 @@ This blueprint deploys the bot as a Render Web Service and binds the health serv
 
 ## Important
 
-Render Free Web Services have an ephemeral filesystem. The local SQLite database and generated wallets can be lost on restart, redeploy, or spin-down. Use this for testing only unless you move storage to Postgres or upgrade to a paid service with a persistent disk.
+The bot uses Postgres for proposals, encrypted wallet records, audits, vanity mints, and launch jobs. Render's ephemeral filesystem is used only for temporary logs. Never deploy without `DATABASE_URL` and never change `WALLET_ENCRYPTION_KEY` after wallets have been created.
 
 ## Deploy Steps
 
@@ -14,7 +14,9 @@ Render Free Web Services have an ephemeral filesystem. The local SQLite database
 4. Choose **Blueprint**.
 5. Connect `juwonsmith/voidlauncher-bot`.
 6. Select `render.yaml`.
-7. Add the secret environment variables Render asks for:
+7. Create a persistent Postgres database, then copy its pooled connection string.
+8. Add the secret environment variables Render asks for:
+   - `DATABASE_URL`
    - `TELEGRAM_BOT_TOKEN`
    - `ADMIN_TELEGRAM_IDS`
    - `WALLET_ENCRYPTION_KEY`
@@ -24,9 +26,22 @@ Render Free Web Services have an ephemeral filesystem. The local SQLite database
    - `PUMPPORTAL_API_KEY`
    - `BAGS_API_KEY`
    - `PLATFORM_TREASURY_WALLET`
-8. Keep `DRY_RUN=true` for the first deploy.
-9. Deploy.
-10. After logs show `Telegram launchpad bot polling started.`, set `DRY_RUN=false` only when the wallets and keys are ready.
+9. Keep `DRY_RUN=true` for the first deploy.
+10. Deploy.
+11. Confirm the logs show `database_connected` followed by `Telegram launchpad bot polling started.`
+12. Set `DRY_RUN=false` only when the wallets and keys are ready.
+
+## Migrate Existing SQLite Data
+
+Keep the existing `data/bot.sqlite` and the same `WALLET_ENCRYPTION_KEY`. Put the new Postgres connection string in local `.env` as `DATABASE_URL`, stop every running bot instance, then run:
+
+Before redeploying, use the existing bot's DM wallet-export commands for any funded wallet that exists only on Render. A Render redeploy discards its current ephemeral SQLite file, so do not assume that file will survive the switch.
+
+```powershell
+npm run db:migrate:sqlite
+```
+
+The migration is transactional and can be rerun. It preserves proposal IDs, encrypted wallet records, audits, launch attempts, queued jobs, and vanity mints. After it completes, add the same `DATABASE_URL` and `WALLET_ENCRYPTION_KEY` to Render and deploy.
 
 ## Avoid Telegram 409 Conflict
 

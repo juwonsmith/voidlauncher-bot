@@ -99,7 +99,7 @@ export async function launchWithPumpPortalApiKey(proposal: Proposal, pumpPortalA
     throw new Error("Pump.fun launches now use the official Pump.fun SDK. Use group wallet launch or set PUMPFUN_SIGNER_PRIVATE_KEY.");
   }
 
-  const mintKeypair = getMintKeypair(proposal);
+  const mintKeypair = await getMintKeypair(proposal);
 
   try {
     console.log(`[launch:${proposal.id}] preparing metadata for ${proposal.launchpad}`);
@@ -107,7 +107,7 @@ export async function launchWithPumpPortalApiKey(proposal: Proposal, pumpPortalA
 
     console.log(`[launch:${proposal.id}] metadata ready: ${metadataUri}`);
     const signature = await sendCreateWithRetries(proposal, mintKeypair, metadataUri, pumpPortalApiKey);
-    if (mintKeypair.poolId) markVanityMintUsed(mintKeypair.poolId);
+    if (mintKeypair.poolId) await markVanityMintUsed(mintKeypair.poolId);
 
     return {
       launchpad: proposal.launchpad,
@@ -120,8 +120,8 @@ export async function launchWithPumpPortalApiKey(proposal: Proposal, pumpPortalA
     };
   } catch (error) {
     if (mintKeypair.poolId) {
-      if (error instanceof UnknownConfirmationError) markVanityMintUsed(mintKeypair.poolId);
-      else releaseVanityMint(mintKeypair.poolId);
+      if (error instanceof UnknownConfirmationError) await markVanityMintUsed(mintKeypair.poolId);
+      else await releaseVanityMint(mintKeypair.poolId);
     }
     throw error;
   }
@@ -151,7 +151,7 @@ export async function launchWithPumpFunSdk(
   );
   validatePumpFunFeeShares(proposal, signerKeypair.publicKey);
 
-  const mintKeypair = getMintKeypair(proposal);
+  const mintKeypair = await getMintKeypair(proposal);
   const mintSigner = Keypair.fromSecretKey(bs58.decode(mintKeypair.secretKeyBase58));
 
   try {
@@ -167,7 +167,7 @@ export async function launchWithPumpFunSdk(
       signerSecretKeyBase58,
       signerKeypair.publicKey.toBase58()
     ).catch((error): PlatformFeeResult => ({ error: errorMessage(error) }));
-    if (mintKeypair.poolId) markVanityMintUsed(mintKeypair.poolId);
+    if (mintKeypair.poolId) await markVanityMintUsed(mintKeypair.poolId);
 
     return {
       launchpad: proposal.launchpad,
@@ -186,8 +186,8 @@ export async function launchWithPumpFunSdk(
     };
   } catch (error) {
     if (mintKeypair.poolId) {
-      if (error instanceof UnknownConfirmationError) markVanityMintUsed(mintKeypair.poolId);
-      else releaseVanityMint(mintKeypair.poolId);
+      if (error instanceof UnknownConfirmationError) await markVanityMintUsed(mintKeypair.poolId);
+      else await releaseVanityMint(mintKeypair.poolId);
     }
     throw error;
   }
@@ -201,7 +201,7 @@ async function launchBonkWithFreshMints(proposal: Proposal, pumpPortalApiKey: st
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= config.LAUNCH_MAX_ATTEMPTS; attempt += 1) {
-    const mintKeypair = getMintKeypair(proposal);
+    const mintKeypair = await getMintKeypair(proposal);
     let submitted = false;
 
     try {
@@ -210,7 +210,7 @@ async function launchBonkWithFreshMints(proposal: Proposal, pumpPortalApiKey: st
       submitted = true;
       console.log(`[launch:${proposal.id}] launch signature: ${signature}`);
       await waitForBonkLanding(signature, proposal.id, mintKeypair.address);
-      if (mintKeypair.poolId) markVanityMintUsed(mintKeypair.poolId);
+      if (mintKeypair.poolId) await markVanityMintUsed(mintKeypair.poolId);
 
       return {
         launchpad: proposal.launchpad,
@@ -224,9 +224,9 @@ async function launchBonkWithFreshMints(proposal: Proposal, pumpPortalApiKey: st
     } catch (error) {
       if (mintKeypair.poolId) {
         if (submitted || error instanceof UnlandedLaunchError || error instanceof UnknownConfirmationError) {
-          markVanityMintUsed(mintKeypair.poolId);
+          await markVanityMintUsed(mintKeypair.poolId);
         } else {
-          releaseVanityMint(mintKeypair.poolId);
+          await releaseVanityMint(mintKeypair.poolId);
         }
       }
 
@@ -263,7 +263,7 @@ export async function launchWithPumpPortalLocal(
     priorityFeeForLaunchpad(proposal.launchpad)
   );
 
-  const mintKeypair = getMintKeypair(proposal);
+  const mintKeypair = await getMintKeypair(proposal);
   const mintSigner = Keypair.fromSecretKey(bs58.decode(mintKeypair.secretKeyBase58));
 
   try {
@@ -276,7 +276,7 @@ export async function launchWithPumpPortalLocal(
       signerSecretKeyBase58,
       signerKeypair.publicKey.toBase58()
     ).catch((error): PlatformFeeResult => ({ error: errorMessage(error) }));
-    if (mintKeypair.poolId) markVanityMintUsed(mintKeypair.poolId);
+    if (mintKeypair.poolId) await markVanityMintUsed(mintKeypair.poolId);
 
     return {
       launchpad: proposal.launchpad,
@@ -292,8 +292,8 @@ export async function launchWithPumpPortalLocal(
     };
   } catch (error) {
     if (mintKeypair.poolId) {
-      if (error instanceof UnknownConfirmationError) markVanityMintUsed(mintKeypair.poolId);
-      else releaseVanityMint(mintKeypair.poolId);
+      if (error instanceof UnknownConfirmationError) await markVanityMintUsed(mintKeypair.poolId);
+      else await releaseVanityMint(mintKeypair.poolId);
     }
     throw error;
   }
@@ -1045,10 +1045,10 @@ export async function probePumpPortalLocalCreate(
   };
 }
 
-function getMintKeypair(proposal: Proposal): MintKeypair {
+async function getMintKeypair(proposal: Proposal): Promise<MintKeypair> {
   const suffix = mintSuffixForLaunchpad(proposal).trim();
   if (suffix) {
-    const mint = consumeVanityMint(suffix, proposal.id);
+    const mint = await consumeVanityMint(suffix, proposal.id);
     if (!mint) {
       throw new Error(
         `No pre-generated ${proposal.launchpad} mint ending in "${suffix}" is ready. ` +
@@ -1056,7 +1056,7 @@ function getMintKeypair(proposal: Proposal): MintKeypair {
       );
     }
     if (!mint.address.endsWith(suffix)) {
-      releaseVanityMint(mint.id);
+      await releaseVanityMint(mint.id);
       throw new Error(`Prepared vanity mint ${mint.address} does not end with exact suffix "${suffix}".`);
     }
 

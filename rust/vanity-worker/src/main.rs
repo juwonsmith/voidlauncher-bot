@@ -20,6 +20,7 @@ struct Config {
     suffix: String,
     pool_size: usize,
     workers: usize,
+    stdout_mode: bool,
 }
 
 fn main() {
@@ -38,11 +39,16 @@ fn main() {
         std::process::exit(1);
     }
 
-    ensure_schema(&config.database_path).expect("failed to create vanity_mints table");
+    if !config.stdout_mode {
+        ensure_schema(&config.database_path).expect("failed to create vanity_mints table");
+    }
 
     println!(
-        "Vanity worker started: suffix={} pool_size={} workers={} db={}",
-        config.suffix, config.pool_size, config.workers, config.database_path
+        "Vanity worker started: suffix={} pool_size={} workers={} storage={}",
+        config.suffix,
+        config.pool_size,
+        config.workers,
+        if config.stdout_mode { "postgres bridge" } else { &config.database_path }
     );
 
     let attempts = Arc::new(AtomicU64::new(0));
@@ -78,6 +84,20 @@ fn main() {
 
     let mut last_attempts = 0;
     loop {
+        if config.stdout_mode {
+            match receiver.recv_timeout(Duration::from_secs(5)) {
+                Ok(mint) => println!("VANITY_MINT\t{}\t{}", mint.address, mint.secret_key_base58),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let current_attempts = attempts.load(Ordering::Relaxed);
+                    let delta = current_attempts.saturating_sub(last_attempts);
+                    last_attempts = current_attempts;
+                    println!("Searching... Attempts={} (+{})", current_attempts, delta);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            continue;
+        }
+
         let available = count_available(&config.database_path, &config.suffix).unwrap_or(0);
         if available >= config.pool_size {
             let current_attempts = attempts.load(Ordering::Relaxed);
@@ -130,12 +150,16 @@ fn read_config() -> Result<Config, String> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|count| count.get()).unwrap_or(4));
+    let stdout_mode = env::var("VANITY_STDOUT_MODE")
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
     Ok(Config {
         database_path,
         suffix,
         pool_size,
         workers,
+        stdout_mode,
     })
 }
 
