@@ -1,6 +1,7 @@
 import { Context, Telegraf } from "telegraf";
 import type { InlineKeyboardButton } from "telegraf/types";
 import { PublicKey } from "@solana/web3.js";
+import crypto from "node:crypto";
 import http from "node:http";
 import { ZodError } from "zod";
 import { config, requireAdmin } from "./config.js";
@@ -34,8 +35,22 @@ import {
   updateProposalCashback,
   updateProposalFeeShares,
   assertDatabaseReady,
-  closeDatabase
+  closeDatabase,
+  getPayoutWallets,
+  isLaunchWalletAddress,
+  setPayoutWallet,
+  type FeeChain,
+  type PayoutScope
 } from "./db.js";
+import {
+  chainLabel,
+  checkCreatorFees,
+  claimCreatorFees,
+  feeClaimResultMessage,
+  feeStatusMessage,
+  parsePayoutAddress,
+  type FeeClaimScope
+} from "./feeClaims/index.js";
 import { launchOnRobinhood, launchProposal, readRobinhoodLaunchFeeEth, robinhoodLaunchpadName } from "./launchpads/index.js";
 import { launchWithBags } from "./launchpads/bags.js";
 import {
@@ -135,6 +150,12 @@ const grinderApi: GrinderApi = {
   pendingOrders: () => [...pendingCustomCaOrders.values()],
   submitResult: storeCustomCaResult
 };
+// Payout addresses waiting for their Confirm tap, keyed by the nonce in the button.
+const pendingPayouts = new Map<
+  string,
+  { scope: FeeClaimScope; chain: FeeChain; address: string; userId: number; expiresAt: number }
+>();
+const activeFeeClaims = new Set<string>();
 
 type DraftStep =
   | "launchpad"
@@ -429,6 +450,120 @@ bot.action(/^export_group_wallet:(\d+)$/, async (ctx) => {
     exportMessage(`Group PumpPortal Wallet Export ${wallet.scopeId}`, exported.address, exported.secretKey, exported.apiKey),
     telegramReplyOptions
   );
+});
+
+// Creator fees build up for the launch wallets. The group owner picks where claimed fees go with /setpayout and
+// admins claim with /claimfees; members do the same for their personal wallets with /setmypayout and /claimmyfees.
+bot.command("setpayout", async (ctx) => {
+  if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup") {
+    return ctx.reply("Use /setpayout inside the group. For your personal wallets, use /setmypayout.");
+  }
+  const scope: FeeClaimScope = { kind: "group", id: String(ctx.chat.id) };
+  const address = commandArgument(ctx.message.text);
+  if (!address) return ctx.reply(payoutOverviewMessage(scope, await getPayoutWallets("group", scope.id)), telegramReplyOptions);
+  if (!(await isGroupOwner(ctx))) return ctx.reply("Only the group owner can set where the group's fees go.");
+  await askPayoutConfirmation(ctx, scope, address);
+});
+
+bot.command("setmypayout", async (ctx) => {
+  if (!ctx.from) return ctx.reply("I could not identify you.");
+  const scope: FeeClaimScope = { kind: "user", id: String(ctx.from.id) };
+  const address = commandArgument(ctx.message.text);
+  if (!address) return ctx.reply(payoutOverviewMessage(scope, await getPayoutWallets("user", scope.id)), telegramReplyOptions);
+  await askPayoutConfirmation(ctx, scope, address);
+});
+
+bot.action(/^payout_ok:([a-f0-9]{12})$/, async (ctx) => {
+  const nonce = ctx.match[1];
+  const pending = pendingPayouts.get(nonce);
+  if (!pending || pending.expiresAt < Date.now()) {
+    pendingPayouts.delete(nonce);
+    await safeAnswerCallback(ctx, "This request expired. Send the command again.");
+    return;
+  }
+  if (ctx.from?.id !== pending.userId) {
+    await safeAnswerCallback(ctx, "Only the person who sent the command can confirm it.");
+    return;
+  }
+
+  pendingPayouts.delete(nonce);
+  await setPayoutWallet(pending.scope.kind, pending.scope.id, pending.chain, pending.address, ctx.from.id);
+  audit(ctx, "payout_wallet_set", undefined, {
+    scope: pending.scope.kind,
+    scopeId: pending.scope.id,
+    chain: pending.chain,
+    address: pending.address
+  });
+  await safeAnswerCallback(ctx, "Payout wallet saved.");
+  await safeEditMessageText(
+    ctx,
+    [
+      `&#9989; <b>${chainLabel(pending.chain)} payout wallet set</b>`,
+      "",
+      `<code>${escapeHtml(pending.address)}</code>`,
+      "",
+      `Claim fees with <code>${pending.scope.kind === "group" ? "/claimfees" : "/claimmyfees"}</code>.`
+    ].join("\n"),
+    []
+  );
+});
+
+bot.action(/^payout_no:([a-f0-9]{12})$/, async (ctx) => {
+  const pending = pendingPayouts.get(ctx.match[1]);
+  if (pending && ctx.from?.id !== pending.userId) {
+    await safeAnswerCallback(ctx, "Only the person who sent the command can cancel it.");
+    return;
+  }
+  pendingPayouts.delete(ctx.match[1]);
+  await safeAnswerCallback(ctx, "Cancelled.");
+  await safeEditMessageText(ctx, "Payout wallet not changed.", []);
+});
+
+bot.command("claimfees", async (ctx) => {
+  if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup") {
+    return ctx.reply("Use /claimfees inside the group. For your personal wallets, use /claimmyfees.");
+  }
+  if (!(await isBotAdmin(ctx))) return ctx.reply("Admin command only.");
+  await sendCreatorFeeStatus(ctx, { kind: "group", id: String(ctx.chat.id) });
+});
+
+bot.command("claimmyfees", async (ctx) => {
+  if (!ctx.from) return ctx.reply("I could not identify you.");
+  await sendCreatorFeeStatus(ctx, { kind: "user", id: String(ctx.from.id) });
+});
+
+bot.action(/^claim_fees:(group|user):(-?\d+)$/, async (ctx) => {
+  const scope: FeeClaimScope = { kind: ctx.match[1] as PayoutScope, id: ctx.match[2] };
+  if (!(await canClaimFees(ctx, scope))) {
+    await safeAnswerCallback(ctx, scope.kind === "group" ? "Admin command only." : "Only the wallet's owner can claim these fees.");
+    return;
+  }
+  if (config.DRY_RUN) {
+    await safeAnswerCallback(ctx, "Dry run: nothing claimed.");
+    await ctx.reply("&#129514; Dry run is on, so no fees were claimed and nothing was sent.", telegramReplyOptions);
+    return;
+  }
+
+  // Funds only ever go to the stored payout wallet, so any admin may start a claim, but only one at a time.
+  const lockKey = `${scope.kind}:${scope.id}`;
+  if (activeFeeClaims.has(lockKey)) {
+    await safeAnswerCallback(ctx, "Already claiming. Hang on.");
+    return;
+  }
+  activeFeeClaims.add(lockKey);
+  await safeAnswerCallback(ctx, "Claiming...");
+  await safeEditMessageText(ctx, "&#9203; <b>Claiming creator fees...</b>\nThis can take a minute.", []);
+  void runFeeClaim(ctx, scope).finally(() => activeFeeClaims.delete(lockKey));
+});
+
+bot.action(/^claim_fees_cancel:(group|user):(-?\d+)$/, async (ctx) => {
+  const scope: FeeClaimScope = { kind: ctx.match[1] as PayoutScope, id: ctx.match[2] };
+  if (!(await canClaimFees(ctx, scope))) {
+    await safeAnswerCallback(ctx, "Only whoever can claim these fees can cancel.");
+    return;
+  }
+  await safeAnswerCallback(ctx, "Cancelled.");
+  await safeEditMessageText(ctx, "Fee claim cancelled.", []);
 });
 
 bot.command("idea", async (ctx) => {
@@ -2824,6 +2959,137 @@ async function isBotAdmin(ctx: Context): Promise<boolean> {
   }
 }
 
+async function isGroupOwner(ctx: Context): Promise<boolean> {
+  const userId = ctx.from?.id;
+  if (requireAdmin(userId)) return true;
+  if (!userId) return false;
+
+  try {
+    return (await ctx.getChatMember(userId)).status === "creator";
+  } catch (error) {
+    logError("group_owner_check_failed", error, { chatId: ctx.chat?.id, fromId: userId });
+    return false;
+  }
+}
+
+async function canClaimFees(ctx: Context, scope: FeeClaimScope): Promise<boolean> {
+  if (scope.kind === "user") return String(ctx.from?.id) === scope.id;
+  return String(ctx.chat?.id) === scope.id && (await isBotAdmin(ctx));
+}
+
+function commandArgument(text: string): string {
+  return text.trim().split(/\s+/)[1] ?? "";
+}
+
+function payoutOverviewMessage(scope: FeeClaimScope, payouts: Partial<Record<FeeChain, string>>): string {
+  const show = (address?: string) => (address ? `<code>${escapeHtml(address)}</code>` : "not set");
+  return [
+    scope.kind === "group" ? "<b>Group payout wallets</b>" : "<b>Your payout wallets</b>",
+    "",
+    `Solana: ${show(payouts.solana)}`,
+    `Robinhood Chain: ${show(payouts.robinhood)}`,
+    "",
+    scope.kind === "group"
+      ? "Creator fees the group claims with <code>/claimfees</code> are sent here. Only the group owner can change them:"
+      : "Creator fees you claim with <code>/claimmyfees</code> are sent here. Change them with:",
+    `<code>${scope.kind === "group" ? "/setpayout" : "/setmypayout"} &lt;address&gt;</code>, using a Solana address or a 0x address for Robinhood Chain.`
+  ].join("\n");
+}
+
+async function askPayoutConfirmation(ctx: Context, scope: FeeClaimScope, rawAddress: string): Promise<void> {
+  if (!ctx.from) return;
+
+  let payout: { chain: FeeChain; address: string };
+  try {
+    payout = parsePayoutAddress(rawAddress);
+  } catch (error) {
+    await ctx.reply(formatError(error), telegramReplyOptions);
+    return;
+  }
+  // A launch wallet as payout would keep the fees in a hot wallet, which is what payouts exist to avoid.
+  if (await isLaunchWalletAddress(payout.address)) {
+    await ctx.reply("That's one of VoidLauncher's launch wallets. Use a wallet you control, like Phantom or MetaMask.");
+    return;
+  }
+
+  const nonce = crypto.randomBytes(6).toString("hex");
+  pendingPayouts.set(nonce, { scope, ...payout, userId: ctx.from.id, expiresAt: Date.now() + 10 * 60_000 });
+  await ctx.reply(
+    [
+      `<b>Set the ${chainLabel(payout.chain)} payout wallet?</b>`,
+      "",
+      `<code>${escapeHtml(payout.address)}</code>`,
+      "",
+      scope.kind === "group"
+        ? "Creator fees this group claims will be sent here."
+        : "Creator fees from your personal wallets will be sent here.",
+      "Check it carefully: fees sent to a wrong address can't be recovered."
+    ].join("\n"),
+    {
+      ...telegramReplyOptions,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "Confirm", callback_data: `payout_ok:${nonce}` },
+            { text: "Cancel", callback_data: `payout_no:${nonce}` }
+          ]
+        ]
+      }
+    }
+  );
+}
+
+/** Posts a progress message, then replaces it with the fee card once the chains have been read. */
+async function sendCreatorFeeStatus(ctx: Context, scope: FeeClaimScope): Promise<void> {
+  const progress = await ctx.reply("&#128270; Checking creator fees...", telegramReplyOptions);
+  void (async () => {
+    try {
+      const { text, canClaim } = feeStatusMessage(scope, await checkCreatorFees(scope));
+      const buttons: InlineKeyboardButton[][] = canClaim
+        ? [
+            [
+              { text: "Claim & send", callback_data: `claim_fees:${scope.kind}:${scope.id}` },
+              { text: "Cancel", callback_data: `claim_fees_cancel:${scope.kind}:${scope.id}` }
+            ]
+          ]
+        : [];
+      await ctx.telegram.editMessageText(progress.chat.id, progress.message_id, undefined, text, {
+        ...telegramReplyOptions,
+        reply_markup: { inline_keyboard: buttons }
+      });
+    } catch (error) {
+      logError("creator_fee_check_failed", error, { scope: scope.kind, scopeId: scope.id });
+      await ctx.telegram
+        .editMessageText(progress.chat.id, progress.message_id, undefined, formatError(error), telegramReplyOptions)
+        .catch(() => undefined);
+    }
+  })();
+}
+
+async function runFeeClaim(ctx: Context, scope: FeeClaimScope): Promise<void> {
+  try {
+    const outcomes = await claimCreatorFees(scope, {
+      chatId: ctx.chat?.id === undefined ? undefined : String(ctx.chat.id),
+      actorId: ctx.from?.id
+    });
+    audit(ctx, "creator_fees_claimed", undefined, {
+      scope: scope.kind,
+      scopeId: scope.id,
+      outcomes: outcomes.map((outcome) => ({
+        chain: outcome.chain,
+        claimed: outcome.claimed.toString(),
+        sent: outcome.sent.toString(),
+        sendTx: outcome.sendTx,
+        errors: outcome.errors
+      }))
+    });
+    await ctx.reply(feeClaimResultMessage(scope, outcomes), telegramReplyOptions);
+  } catch (error) {
+    logError("creator_fee_claim_failed", error, { scope: scope.kind, scopeId: scope.id });
+    await ctx.reply(formatError(error), telegramReplyOptions);
+  }
+}
+
 function formatError(error: unknown, includeHelp = false): string {
   const message =
     error instanceof ZodError
@@ -2975,6 +3241,10 @@ async function setupBotCommands(): Promise<void> {
     { command: "rhgroupbalance", description: "Check Robinhood group wallet balance" },
     { command: "rhmywallet", description: "Create/show Robinhood personal wallet" },
     { command: "rhmybalance", description: "Check Robinhood personal wallet balance" },
+    { command: "claimfees", description: "Claim the group's creator fees" },
+    { command: "setpayout", description: "Group owner: where claimed fees go" },
+    { command: "claimmyfees", description: "Claim your personal creator fees" },
+    { command: "setmypayout", description: "Where your claimed fees go" },
     { command: "launchme", description: "Launch your own proposal" },
     { command: "feesettings", description: "Show proposal fee settings" },
     { command: "cashback", description: "Set Pump.fun cashback on/off" },

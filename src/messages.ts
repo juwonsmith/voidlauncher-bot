@@ -34,7 +34,8 @@ export function helpMessage(): string {
     "&#9989; Ideas go to admin review before launch.",
     "&#128188; Group wallet launches use the group launch wallet.",
     "&#127890; Bags launches use the group launch wallet.",
-    "&#129001; Robinhood Chain launches use the Robinhood ETH wallet."
+    "&#129001; Robinhood Chain launches use the Robinhood ETH wallet.",
+    "&#128176; Creator fees: <code>/claimfees</code> sends them to the payout wallet the group owner sets with <code>/setpayout</code>."
   ].join("\n");
 }
 
@@ -168,6 +169,12 @@ export function commandHelpMessage(): string {
     "<code>/rhmywallet</code> - create/show your Robinhood Chain personal wallet",
     "<code>/rhmybalance</code> - check your Robinhood Chain personal wallet balance",
     "<code>/txcheck &lt;signature&gt; [ca]</code> - inspect a launch transaction",
+    "",
+    "<b>Creator Fees</b>",
+    "<code>/setpayout &lt;address&gt;</code> - group owner: the wallet claimed group fees go to (Solana or 0x)",
+    "<code>/claimfees</code> - claim the group wallets' creator fees and send them to the payout wallet",
+    "<code>/setmypayout &lt;address&gt;</code> - the wallet your claimed personal fees go to",
+    "<code>/claimmyfees</code> - claim your personal wallets' creator fees",
     "",
     "<b>Admin DM Only</b>",
     "<code>/exportgroupwallet</code> - choose and export a group wallet",

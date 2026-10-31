@@ -71,6 +71,30 @@ Wallet-funded launches:
 
 `/launchgroup` is admin-only and spends from the encrypted group wallet. `/launchme` spends from the caller's personal wallet and can be used by the proposal creator or configured admin.
 
+Creator fees:
+
+```text
+/setpayout <address>
+/claimfees
+/setmypayout <address>
+/claimmyfees
+```
+
+Every launch makes its launch wallet the coin's fee receiver, so creator fees build up for the group or personal wallet that paid for it. Treat those wallets as disposable: they pay for launches and claim fees, and claimed fees move straight on to a payout wallet.
+
+- `/setpayout <address>`: the group owner (or a configured admin) sets where the group's claimed fees go. A Solana address covers Pump.fun and Bags; a 0x address covers Robinhood Chain. The bot asks for confirmation and refuses its own launch wallets.
+- `/claimfees`: any bot admin in the group sees what's claimable and taps **Claim & send**. The bot claims into the launch wallets, then sends what it claimed to the payout wallets. Funds only ever go to the stored payout wallet.
+- `/setmypayout` and `/claimmyfees` do the same for a member's personal wallets.
+
+What gets claimed:
+
+- Pump.fun: the wallet's creator vaults (bonding curve, and PumpSwap after graduation), plus its share of coins launched with fee sharing ("Creator 100%" and Custom Split), which Pump.fun pays out once a coin's fees pass its payout minimum.
+- Bags: every coin the wallet is a fee claimer for.
+- Pons (Robinhood Chain): each coin's bonding-curve fees are swept into Pons' fee escrow (the creator gets 70% of the 1% trading fee), then the escrow is claimed in ETH. Pons sweeps graduated coins itself.
+- Bonk isn't supported yet: PumpPortal can't claim LetsBonk fees, so it would need Raydium's LaunchLab SDK.
+
+Network fees come out of the launch wallet, so keep about 0.001 SOL or 0.0005 ETH in it. Each claim is written to the `fee_claims` table before the payout transfer goes out. A failed transfer is retried on the next claim, and one that may have landed is never sent twice.
+
 Per-launch platform fee:
 
 ```env

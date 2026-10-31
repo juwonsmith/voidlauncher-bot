@@ -107,7 +107,7 @@ async function sendBagsTransaction(
   }
 }
 
-async function callBagsApi<T>(label: string, run: () => Promise<T>): Promise<T> {
+export async function callBagsApi<T>(label: string, run: () => Promise<T>): Promise<T> {
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= 5; attempt += 1) {

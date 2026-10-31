@@ -10,6 +10,7 @@ import {
 } from "@solana/web3.js";
 import BN from "bn.js";
 import bs58 from "bs58";
+import { createRequire } from "node:module";
 import nacl from "tweetnacl";
 import { config } from "../config.js";
 import { customCaFeeSol, customCaKeypairProblem, describeCustomCa } from "../customCa.js";
@@ -78,9 +79,13 @@ class UnknownConfirmationError extends Error {}
 class NonRetryableLaunchError extends Error {}
 class UnlandedLaunchError extends Error {}
 
-async function loadPumpSdk(): Promise<PumpSdkPackage> {
-  const modulePath = "../../node_modules/@pump-fun/pump-sdk/dist/esm/index.js";
-  return (await import(modulePath)) as PumpSdkPackage;
+// The SDK's ESM build is plain .js in a package without "type": "module", which Node only loads from 20.19/22.7 on
+// (Render runs 20.18). Its CommonJS build loads on any version and shares @solana/web3.js with the bot, since that
+// package has no separate ESM entry for Node.
+const requireCommonJs = createRequire(import.meta.url);
+
+export async function loadPumpSdk(): Promise<PumpSdkPackage> {
+  return requireCommonJs("@pump-fun/pump-sdk") as PumpSdkPackage;
 }
 
 export async function launchWithPumpPortal(proposal: Proposal): Promise<LaunchResult> {
