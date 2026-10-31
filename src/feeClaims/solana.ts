@@ -1,5 +1,5 @@
 // Creator-fee claims for Solana launch wallets: Pump.fun (the wallet's own creator vaults, plus its share of coins
-// launched with fee sharing) and Bags. Claims land in the launch wallet; index.ts forwards them to the payout wallet.
+// launched with fee sharing) and Bags. Claims land in the launch wallet.
 import { BagsSDK } from "@bagsfm/bags-sdk";
 import {
   ComputeBudgetProgram,
@@ -7,8 +7,6 @@ import {
   Keypair,
   LAMPORTS_PER_SOL,
   PublicKey,
-  SendTransactionError,
-  SystemProgram,
   Transaction,
   VersionedTransaction,
   type AccountInfo,
@@ -20,14 +18,13 @@ import bs58 from "bs58";
 import { config } from "../config.js";
 import { callBagsApi } from "../launchpads/bags.js";
 import { loadPumpSdk } from "../launchpads/pumpportal.js";
-import { TransferNotSentError, type ClaimRun, type FeeClaimed } from "./types.js";
+import type { ClaimRun, FeeClaimed } from "./types.js";
 
 const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 const NATIVE_MINT = new PublicKey("So11111111111111111111111111111111111111112");
 // What a plain system account must keep to stay rent-exempt.
 const RENT_EXEMPT_LAMPORTS = 890_880n;
-const BASE_FEE_LAMPORTS = 5_000n;
 // Checked before sending anything: the network fee for each claim transaction, plus the rent of the temporary WSOL
 // account a PumpSwap claim opens (refunded when it closes in the same transaction).
 const CLAIM_TX_FEE_LAMPORTS = 60_000n;
@@ -134,12 +131,8 @@ async function planBagsClaims(connection: Connection, wallet: PublicKey): Promis
   }
 }
 
-/** Claims everything in the plan into the launch wallet, reporting each claim as soon as it confirms. */
-export async function claimSolanaFees(
-  secretKeyBase58: string,
-  plan: SolanaFeePlan,
-  onClaim: (claim: FeeClaimed) => Promise<void>
-): Promise<ClaimRun> {
+/** Claims everything in the plan into the launch wallet. */
+export async function claimSolanaFees(secretKeyBase58: string, plan: SolanaFeePlan): Promise<ClaimRun> {
   const run: ClaimRun = { claims: [], errors: [] };
   const hasPumpVaults = plan.pumpCurve > 0n || plan.pumpAmm > 0n;
   const transactions = (hasPumpVaults ? 1 : 0) + plan.pumpShares.length + plan.bags.length;
@@ -159,10 +152,8 @@ export async function claimSolanaFees(
     );
   }
 
-  const record = async (launchpad: FeeClaimed["launchpad"], tx: string, amount: bigint) => {
-    const claim = { launchpad, amount, tx };
-    run.claims.push(claim);
-    await onClaim(claim);
+  const record = (launchpad: FeeClaimed["launchpad"], tx: string, amount: bigint) => {
+    run.claims.push({ launchpad, amount, tx });
   };
   const sdk = (await loadPumpSdk()) as unknown as PumpFeeSdk;
   const online = new sdk.OnlinePumpSdk(connection);
@@ -171,7 +162,7 @@ export async function claimSolanaFees(
     try {
       const instructions = await pumpVaultClaimInstructions(connection, plan);
       const sent = await sendInstructions(connection, signer, instructions, "Pump.fun creator fee claim");
-      await record("pumpfun", sent.signature, sent.received ?? plan.pumpCurve + plan.pumpAmm);
+      record("pumpfun", sent.signature, sent.received ?? plan.pumpCurve + plan.pumpAmm);
     } catch (error) {
       run.errors.push(`Pump.fun: ${errorText(error)}`);
     }
@@ -182,7 +173,7 @@ export async function claimSolanaFees(
       // Pays every shareholder of the coin, this wallet included.
       const { instructions } = await online.buildDistributeCreatorFeesInstructions(new PublicKey(share.mint));
       const sent = await sendInstructions(connection, signer, instructions, "Pump.fun fee-sharing payout");
-      await record("pumpfun", sent.signature, sent.received ?? share.amount);
+      record("pumpfun", sent.signature, sent.received ?? share.amount);
     } catch (error) {
       run.errors.push(`Pump.fun fee sharing ${shortAddress(share.mint)}: ${errorText(error)}`);
     }
@@ -199,7 +190,7 @@ export async function claimSolanaFees(
           const sent = await sendPrebuiltTransaction(connection, transaction, signer, "Bags fee claim");
           // Bags may split a claim over several transactions; without a measurement, the last one carries the estimate.
           const isLast = transaction === claimTransactions[claimTransactions.length - 1];
-          await record("bags", sent.signature, sent.received ?? (isLast ? position.amount : 0n));
+          record("bags", sent.signature, sent.received ?? (isLast ? position.amount : 0n));
         }
       } catch (error) {
         run.errors.push(`Bags ${shortAddress(position.mint)}: ${errorText(error)}`);
@@ -232,62 +223,6 @@ export async function pumpVaultClaimInstructions(connection: Connection, plan: S
   const wallet = new PublicKey(plan.wallet);
   const [curveCollect, ...ammCollect] = await new sdk.OnlinePumpSdk(connection).collectCoinCreatorFeeInstructions(wallet, wallet);
   return [...(plan.pumpCurve > 0n ? [curveCollect] : []), ...(plan.pumpAmm > 0n ? ammCollect : [])];
-}
-
-/**
- * Sends `lamports` (or as much as the wallet can spare while staying rent-exempt) to the payout wallet.
- * `onSigned` runs before the broadcast so the caller can note the signature first.
- */
-export async function forwardSolanaFees(
-  secretKeyBase58: string,
-  payoutAddress: string,
-  lamports: bigint,
-  onSigned: (signature: string) => Promise<void>
-): Promise<{ tx: string; amount: bigint }> {
-  const connection = solanaConnection();
-  const signer = Keypair.fromSecretKey(bs58.decode(secretKeyBase58));
-  // A transfer plus the two compute-budget instructions uses about 450 compute units.
-  const unitLimit = 1_000;
-  const microLamports = Math.ceil((config.DEFAULT_PRIORITY_FEE_SOL * LAMPORTS_PER_SOL * 1_000_000) / unitLimit);
-  const networkFee = BASE_FEE_LAMPORTS + BigInt(Math.ceil((unitLimit * microLamports) / 1_000_000));
-
-  const balance = BigInt(await connection.getBalance(signer.publicKey, "confirmed"));
-  const spendable = balance - networkFee - RENT_EXEMPT_LAMPORTS;
-  const amount = lamports < spendable ? lamports : spendable;
-  if (amount <= 0n) {
-    throw new TransferNotSentError(
-      `The launch wallet can't cover the network fee for the transfer. Send about 0.001 SOL to ${signer.publicKey.toBase58()} and try again.`
-    );
-  }
-
-  const latestBlockhash = await connection.getLatestBlockhash("confirmed");
-  const transaction = new Transaction().add(
-    ComputeBudgetProgram.setComputeUnitLimit({ units: unitLimit }),
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports }),
-    SystemProgram.transfer({ fromPubkey: signer.publicKey, toPubkey: new PublicKey(payoutAddress), lamports: amount })
-  );
-  transaction.feePayer = signer.publicKey;
-  transaction.recentBlockhash = latestBlockhash.blockhash;
-  transaction.sign(signer);
-  const signature = bs58.encode(transaction.signature!);
-
-  await onSigned(signature);
-  try {
-    await connection.sendRawTransaction(transaction.serialize(), { maxRetries: 3 });
-  } catch (error) {
-    // An RPC rejection means the transfer never went out; anything else may have reached the network.
-    if (error instanceof SendTransactionError) throw new TransferNotSentError(`Transfer rejected: ${errorText(error)}`);
-    throw error;
-  }
-  await confirmSignature(connection, signature, latestBlockhash, "Payout transfer");
-  return { tx: signature, amount };
-}
-
-export async function solanaTransferStatus(signature: string): Promise<"landed" | "failed" | "unknown"> {
-  const { value } = await solanaConnection().getSignatureStatus(signature, { searchTransactionHistory: true });
-  if (!value) return "unknown";
-  if (value.err) return "failed";
-  return value.confirmationStatus === "confirmed" || value.confirmationStatus === "finalized" ? "landed" : "unknown";
 }
 
 /** Signs and sends our own instructions with a priority fee sized from a simulation. */

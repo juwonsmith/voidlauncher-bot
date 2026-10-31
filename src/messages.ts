@@ -35,7 +35,7 @@ export function helpMessage(): string {
     "&#128188; Group wallet launches use the group launch wallet.",
     "&#127890; Bags launches use the group launch wallet.",
     "&#129001; Robinhood Chain launches use the Robinhood ETH wallet.",
-    "&#128176; Creator fees: <code>/claimfees</code> sends them to the payout wallet the group owner sets with <code>/setpayout</code>."
+    "&#128176; Creator fees: <code>/claimfees</code> claims them into the group wallet; group admins export its key in a DM with <code>/exportgroupwallet</code>."
   ].join("\n");
 }
 
@@ -171,15 +171,13 @@ export function commandHelpMessage(): string {
     "<code>/txcheck &lt;signature&gt; [ca]</code> - inspect a launch transaction",
     "",
     "<b>Creator Fees</b>",
-    "<code>/setpayout &lt;address&gt;</code> - group owner: the wallet claimed group fees go to (Solana or 0x)",
-    "<code>/claimfees</code> - claim the group wallets' creator fees and send them to the payout wallet",
-    "<code>/setmypayout &lt;address&gt;</code> - the wallet your claimed personal fees go to",
+    "<code>/claimfees</code> - claim the group wallets' creator fees into those wallets",
     "<code>/claimmyfees</code> - claim your personal wallets' creator fees",
     "",
-    "<b>Admin DM Only</b>",
-    "<code>/exportgroupwallet</code> - choose and export a group wallet",
-    "<code>/exportgroupwallet &lt;group_id&gt;</code> - export a specific group wallet",
-    "<code>/exportmywallet</code> - export your personal wallet",
+    "<b>DM Only</b>",
+    "<code>/exportgroupwallet</code> - group owners and admins: choose a group and export its wallet keys",
+    "<code>/exportgroupwallet &lt;group_id&gt;</code> - export a specific group's wallet keys",
+    "<code>/exportmywallet</code> - export your personal wallet keys",
     "",
     `Supported launchpads: <b>Pump.fun</b>, <b>Bonk</b>, <b>Bags</b>, and <b>Robinhood Chain</b> (via ${
       config.ROBINHOOD_LAUNCHPAD === "bags" ? "Bags" : "Pons"

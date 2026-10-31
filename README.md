@@ -53,12 +53,15 @@ Wallets:
 
 `/groupwallet` creates one encrypted launch wallet for the Telegram group. `/mywallet` creates one encrypted personal wallet for the user. The bot shows deposit addresses and balances, never private keys.
 
-Configured admins can export wallet private keys only in DM with the bot:
+Wallet private keys can be exported only in DM with the bot:
 
 ```text
 /exportmywallet
 /exportgroupwallet
+/exportgroupwallet <group_id>
 ```
+
+`/exportmywallet` gives a member the keys of their own personal wallets. `/exportgroupwallet` gives a group's wallet keys to that group's owner and admins (admins only while `ALLOW_GROUP_ADMINS=true`); configured admins can export any group's. Both include the Solana key and, when the wallet exists, the Robinhood Chain key. The PumpPortal API key is only shown to configured admins.
 
 Never run exports in a shared screen/session. Anyone with the private key can drain the wallet.
 
@@ -74,17 +77,14 @@ Wallet-funded launches:
 Creator fees:
 
 ```text
-/setpayout <address>
 /claimfees
-/setmypayout <address>
 /claimmyfees
 ```
 
-Every launch makes its launch wallet the coin's fee receiver, so creator fees build up for the group or personal wallet that paid for it. Treat those wallets as disposable: they pay for launches and claim fees, and claimed fees move straight on to a payout wallet.
+Every launch makes its launch wallet the coin's fee receiver, so creator fees build up for the group or personal wallet that paid for it. Treat those wallets as disposable: they pay for launches and claim fees.
 
-- `/setpayout <address>`: the group owner (or a configured admin) sets where the group's claimed fees go. A Solana address covers Pump.fun and Bags; a 0x address covers Robinhood Chain. The bot asks for confirmation and refuses its own launch wallets.
-- `/claimfees`: any bot admin in the group sees what's claimable and taps **Claim & send**. The bot claims into the launch wallets, then sends what it claimed to the payout wallets. Funds only ever go to the stored payout wallet.
-- `/setmypayout` and `/claimmyfees` do the same for a member's personal wallets.
+- `/claimfees`: any bot admin in the group sees what the group's launch wallets can claim and taps **Claim fees**. The fees land in those wallets; the group's owner or admins then move them by exporting the keys with `/exportgroupwallet` in a DM.
+- `/claimmyfees` does the same for a member's personal wallets, which they export with `/exportmywallet`.
 
 What gets claimed:
 
@@ -93,7 +93,7 @@ What gets claimed:
 - Pons (Robinhood Chain): each coin's bonding-curve fees are swept into Pons' fee escrow (the creator gets 70% of the 1% trading fee), then the escrow is claimed in ETH. Pons sweeps graduated coins itself.
 - Bonk isn't supported yet: PumpPortal can't claim LetsBonk fees, so it would need Raydium's LaunchLab SDK.
 
-Network fees come out of the launch wallet, so keep about 0.001 SOL or 0.0005 ETH in it. Each claim is written to the `fee_claims` table before the payout transfer goes out. A failed transfer is retried on the next claim, and one that may have landed is never sent twice.
+Network fees come out of the launch wallet, so keep about 0.001 SOL or 0.0005 ETH in it.
 
 Per-launch platform fee:
 

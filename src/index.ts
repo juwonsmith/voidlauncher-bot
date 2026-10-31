@@ -1,7 +1,6 @@
 import { Context, Telegraf } from "telegraf";
 import type { InlineKeyboardButton } from "telegraf/types";
 import { PublicKey } from "@solana/web3.js";
-import crypto from "node:crypto";
 import http from "node:http";
 import { ZodError } from "zod";
 import { config, requireAdmin } from "./config.js";
@@ -35,20 +34,13 @@ import {
   updateProposalCashback,
   updateProposalFeeShares,
   assertDatabaseReady,
-  closeDatabase,
-  getPayoutWallets,
-  isLaunchWalletAddress,
-  setPayoutWallet,
-  type FeeChain,
-  type PayoutScope
+  closeDatabase
 } from "./db.js";
 import {
-  chainLabel,
   checkCreatorFees,
   claimCreatorFees,
   feeClaimResultMessage,
   feeStatusMessage,
-  parsePayoutAddress,
   type FeeClaimScope
 } from "./feeClaims/index.js";
 import { launchOnRobinhood, launchProposal, readRobinhoodLaunchFeeEth, robinhoodLaunchpadName } from "./launchpads/index.js";
@@ -150,11 +142,6 @@ const grinderApi: GrinderApi = {
   pendingOrders: () => [...pendingCustomCaOrders.values()],
   submitResult: storeCustomCaResult
 };
-// Payout addresses waiting for their Confirm tap, keyed by the nonce in the button.
-const pendingPayouts = new Map<
-  string,
-  { scope: FeeClaimScope; chain: FeeChain; address: string; userId: number; expiresAt: number }
->();
 const activeFeeClaims = new Set<string>();
 
 type DraftStep =
@@ -375,15 +362,19 @@ bot.command("rhmybalance", async (ctx) => {
   }
 });
 
+// Key exports only ever happen in a DM. Members export their own personal wallets; a group's owner and admins export
+// the group's wallets (admins only while ALLOW_GROUP_ADMINS is on); configured admins can export any group's.
 bot.command("exportmywallet", async (ctx) => {
   if (ctx.chat?.type !== "private") return ctx.reply("Wallet export is only available in DM with the bot.");
-  if (!requireAdmin(ctx.from?.id)) return ctx.reply("Configured admin only.");
   if (!ctx.from) return ctx.reply("I could not identify you.");
 
   try {
-    const exported = await exportWalletSecretBase58("user", String(ctx.from.id));
-    audit(ctx, "wallet_export_user", undefined, { address: exported.address });
-    return ctx.reply(exportMessage("Personal Wallet Export", exported.address, exported.secretKey), telegramReplyOptions);
+    const exported = await exportWallets("user", String(ctx.from.id), requireAdmin(ctx.from.id));
+    if (!exported.solana && !exported.robinhood) {
+      return ctx.reply("You don't have a personal wallet yet. Create one with /mywallet or /rhmywallet.");
+    }
+    audit(ctx, "wallet_export_user", undefined, { solana: exported.solana?.address, robinhood: exported.robinhood?.address });
+    return ctx.reply(walletExportMessage("Your personal wallets", exported), telegramReplyOptions);
   } catch (error) {
     return ctx.reply(formatError(error), telegramReplyOptions);
   }
@@ -391,134 +382,34 @@ bot.command("exportmywallet", async (ctx) => {
 
 bot.command("exportgroupwallet", async (ctx) => {
   if (ctx.chat?.type !== "private") return ctx.reply("Wallet export is only available in DM with the bot.");
-  if (!requireAdmin(ctx.from?.id)) return ctx.reply("Configured admin only.");
+  if (!ctx.from) return ctx.reply("I could not identify you.");
 
   const [, groupId] = ctx.message.text.split(/\s+/, 2);
-  if (!groupId) {
-    const wallets = await listWallets("group_portal");
-    if (wallets.length === 0) return ctx.reply("No group wallets found yet. Create one in a group with /groupwallet.");
+  if (groupId) return sendGroupWalletExport(ctx, ctx.from.id, groupId);
 
-    return ctx.reply(
-      "Select a group wallet to export:",
-      {
-        ...telegramReplyOptions,
-        reply_markup: {
-          inline_keyboard: wallets.map((wallet) => [
-            {
-              text: `${wallet.scopeId} (${wallet.address.slice(0, 4)}...${wallet.address.slice(-4)})`,
-              callback_data: `export_group_wallet:${wallet.id}`
-            }
-          ])
-        }
-      }
-    );
+  const groups = await exportableGroups(ctx.from.id);
+  if (groups.length === 0) {
+    return ctx.reply("There's no group wallet you can export. A group's owner and admins can export its wallets here.");
   }
-
-  try {
-    const exported = await exportPumpPortalWallet("group", groupId);
-    audit(ctx, "wallet_export_group", undefined, { groupId, address: exported.address });
-    return ctx.reply(
-      exportMessage(`Group PumpPortal Wallet Export ${groupId}`, exported.address, exported.secretKey, exported.apiKey),
-      telegramReplyOptions
-    );
-  } catch (error) {
-    return ctx.reply(formatError(error), telegramReplyOptions);
-  }
+  return ctx.reply("Select a group wallet to export:", {
+    ...telegramReplyOptions,
+    reply_markup: {
+      inline_keyboard: groups.map((group) => [{ text: group.label, callback_data: `export_group:${group.id}` }])
+    }
+  });
 });
 
-bot.action(/^export_group_wallet:(\d+)$/, async (ctx) => {
+bot.action(/^export_group:(-?\d+)$/, async (ctx) => {
   if (ctx.chat?.type !== "private") {
     await safeAnswerCallback(ctx, "DM only.");
     return;
   }
-  if (!requireAdmin(ctx.from?.id)) {
-    await safeAnswerCallback(ctx, "Configured admin only.");
-    return;
-  }
-
-  const walletId = Number(ctx.match[1]);
-  const wallet = (await listWallets("group_portal")).find((item) => item.id === walletId);
-  if (!wallet) {
-    await safeAnswerCallback(ctx, "Wallet not found.");
-    return;
-  }
-
-  const exported = await exportPumpPortalWallet("group", wallet.scopeId);
-  audit(ctx, "wallet_export_group", undefined, { groupId: wallet.scopeId, address: exported.address });
-  await safeAnswerCallback(ctx, "Exported.");
-  await ctx.reply(
-    exportMessage(`Group PumpPortal Wallet Export ${wallet.scopeId}`, exported.address, exported.secretKey, exported.apiKey),
-    telegramReplyOptions
-  );
+  await safeAnswerCallback(ctx, "Exporting...");
+  await sendGroupWalletExport(ctx, ctx.from.id, ctx.match[1]);
 });
 
-// Creator fees build up for the launch wallets. The group owner picks where claimed fees go with /setpayout and
-// admins claim with /claimfees; members do the same for their personal wallets with /setmypayout and /claimmyfees.
-bot.command("setpayout", async (ctx) => {
-  if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup") {
-    return ctx.reply("Use /setpayout inside the group. For your personal wallets, use /setmypayout.");
-  }
-  const scope: FeeClaimScope = { kind: "group", id: String(ctx.chat.id) };
-  const address = commandArgument(ctx.message.text);
-  if (!address) return ctx.reply(payoutOverviewMessage(scope, await getPayoutWallets("group", scope.id)), telegramReplyOptions);
-  if (!(await isGroupOwner(ctx))) return ctx.reply("Only the group owner can set where the group's fees go.");
-  await askPayoutConfirmation(ctx, scope, address);
-});
-
-bot.command("setmypayout", async (ctx) => {
-  if (!ctx.from) return ctx.reply("I could not identify you.");
-  const scope: FeeClaimScope = { kind: "user", id: String(ctx.from.id) };
-  const address = commandArgument(ctx.message.text);
-  if (!address) return ctx.reply(payoutOverviewMessage(scope, await getPayoutWallets("user", scope.id)), telegramReplyOptions);
-  await askPayoutConfirmation(ctx, scope, address);
-});
-
-bot.action(/^payout_ok:([a-f0-9]{12})$/, async (ctx) => {
-  const nonce = ctx.match[1];
-  const pending = pendingPayouts.get(nonce);
-  if (!pending || pending.expiresAt < Date.now()) {
-    pendingPayouts.delete(nonce);
-    await safeAnswerCallback(ctx, "This request expired. Send the command again.");
-    return;
-  }
-  if (ctx.from?.id !== pending.userId) {
-    await safeAnswerCallback(ctx, "Only the person who sent the command can confirm it.");
-    return;
-  }
-
-  pendingPayouts.delete(nonce);
-  await setPayoutWallet(pending.scope.kind, pending.scope.id, pending.chain, pending.address, ctx.from.id);
-  audit(ctx, "payout_wallet_set", undefined, {
-    scope: pending.scope.kind,
-    scopeId: pending.scope.id,
-    chain: pending.chain,
-    address: pending.address
-  });
-  await safeAnswerCallback(ctx, "Payout wallet saved.");
-  await safeEditMessageText(
-    ctx,
-    [
-      `&#9989; <b>${chainLabel(pending.chain)} payout wallet set</b>`,
-      "",
-      `<code>${escapeHtml(pending.address)}</code>`,
-      "",
-      `Claim fees with <code>${pending.scope.kind === "group" ? "/claimfees" : "/claimmyfees"}</code>.`
-    ].join("\n"),
-    []
-  );
-});
-
-bot.action(/^payout_no:([a-f0-9]{12})$/, async (ctx) => {
-  const pending = pendingPayouts.get(ctx.match[1]);
-  if (pending && ctx.from?.id !== pending.userId) {
-    await safeAnswerCallback(ctx, "Only the person who sent the command can cancel it.");
-    return;
-  }
-  pendingPayouts.delete(ctx.match[1]);
-  await safeAnswerCallback(ctx, "Cancelled.");
-  await safeEditMessageText(ctx, "Payout wallet not changed.", []);
-});
-
+// Creator fees build up for the launch wallets. /claimfees (admins) and /claimmyfees claim them into those wallets;
+// moving them on means exporting the wallet's key in a DM with the bot.
 bot.command("claimfees", async (ctx) => {
   if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup") {
     return ctx.reply("Use /claimfees inside the group. For your personal wallets, use /claimmyfees.");
@@ -533,18 +424,18 @@ bot.command("claimmyfees", async (ctx) => {
 });
 
 bot.action(/^claim_fees:(group|user):(-?\d+)$/, async (ctx) => {
-  const scope: FeeClaimScope = { kind: ctx.match[1] as PayoutScope, id: ctx.match[2] };
+  const scope: FeeClaimScope = { kind: ctx.match[1] as FeeClaimScope["kind"], id: ctx.match[2] };
   if (!(await canClaimFees(ctx, scope))) {
     await safeAnswerCallback(ctx, scope.kind === "group" ? "Admin command only." : "Only the wallet's owner can claim these fees.");
     return;
   }
   if (config.DRY_RUN) {
     await safeAnswerCallback(ctx, "Dry run: nothing claimed.");
-    await ctx.reply("&#129514; Dry run is on, so no fees were claimed and nothing was sent.", telegramReplyOptions);
+    await ctx.reply("&#129514; Dry run is on, so no fees were claimed.", telegramReplyOptions);
     return;
   }
 
-  // Funds only ever go to the stored payout wallet, so any admin may start a claim, but only one at a time.
+  // Claimed fees stay in the launch wallet, so any admin may start a claim, but only one runs at a time.
   const lockKey = `${scope.kind}:${scope.id}`;
   if (activeFeeClaims.has(lockKey)) {
     await safeAnswerCallback(ctx, "Already claiming. Hang on.");
@@ -557,7 +448,7 @@ bot.action(/^claim_fees:(group|user):(-?\d+)$/, async (ctx) => {
 });
 
 bot.action(/^claim_fees_cancel:(group|user):(-?\d+)$/, async (ctx) => {
-  const scope: FeeClaimScope = { kind: ctx.match[1] as PayoutScope, id: ctx.match[2] };
+  const scope: FeeClaimScope = { kind: ctx.match[1] as FeeClaimScope["kind"], id: ctx.match[2] };
   if (!(await canClaimFees(ctx, scope))) {
     await safeAnswerCallback(ctx, "Only whoever can claim these fees can cancel.");
     return;
@@ -2879,16 +2770,104 @@ async function replyLaunchResult(ctx: Context, result: LaunchResult): Promise<vo
   });
 }
 
-function exportMessage(title: string, address: string, secretKey: string, apiKey?: string): string {
+interface ExportedWallets {
+  solana?: { address: string; secretKey: string; apiKey?: string };
+  robinhood?: { address: string; privateKey: string };
+}
+
+/** A scope's Solana and Robinhood keys, whichever exist. The PumpPortal API key goes to configured admins only. */
+async function exportWallets(scope: "group" | "user", scopeId: string, includeApiKey: boolean): Promise<ExportedWallets> {
+  const solanaScope = scope === "group" ? "group_portal" : "user";
+  const [solanaWallet, robinhoodWallet] = await Promise.all([
+    getWalletSummary(solanaScope, scopeId),
+    getWalletSummary(scope === "group" ? "group_evm" : "user_evm", scopeId)
+  ]);
+  return {
+    solana: solanaWallet
+      ? {
+          ...(await exportWalletSecretBase58(solanaScope, scopeId)),
+          apiKey: includeApiKey && solanaWallet.hasApiKey ? (await getPumpPortalApiKey(scope, scopeId)).apiKey : undefined
+        }
+      : undefined,
+    robinhood: robinhoodWallet ? await getRobinhoodWalletSecret(scope, scopeId) : undefined
+  };
+}
+
+function walletExportMessage(title: string, exported: ExportedWallets): string {
+  const { solana, robinhood } = exported;
   return [
     `<b>${escapeHtml(title)}</b>`,
     "",
-    "<b>Keep this private.</b> Anyone with this key can drain the wallet or trade with the API key.",
-    "",
-    `Address: <code>${escapeHtml(address)}</code>`,
-    `Private key: <code>${escapeHtml(secretKey)}</code>`,
-    apiKey ? `PumpPortal API key: <code>${escapeHtml(apiKey)}</code>` : undefined
-  ].filter(Boolean).join("\n");
+    "<b>Keep this private.</b> Anyone with a private key controls that wallet. Import it into Phantom (Solana) or MetaMask " +
+      "(Robinhood Chain) to move funds, then delete this message.",
+    ...(solana
+      ? [
+          "",
+          "<b>Solana</b>",
+          `Address: <code>${escapeHtml(solana.address)}</code>`,
+          `Private key: <code>${escapeHtml(solana.secretKey)}</code>`,
+          ...(solana.apiKey ? [`PumpPortal API key: <code>${escapeHtml(solana.apiKey)}</code>`] : [])
+        ]
+      : []),
+    ...(robinhood
+      ? [
+          "",
+          "<b>Robinhood Chain</b>",
+          `Address: <code>${escapeHtml(robinhood.address)}</code>`,
+          `Private key: <code>${escapeHtml(robinhood.privateKey)}</code>`
+        ]
+      : [])
+  ].join("\n");
+}
+
+/** A group's owner and admins may export its wallets (admins only with ALLOW_GROUP_ADMINS); configured admins any group's. */
+async function canExportGroupWallet(userId: number, groupId: string): Promise<boolean> {
+  if (requireAdmin(userId)) return true;
+
+  try {
+    const { status } = await bot.telegram.getChatMember(groupId, userId);
+    return status === "creator" || (config.ALLOW_GROUP_ADMINS && status === "administrator");
+  } catch (error) {
+    // Telegram refuses once the bot has left the group; only configured admins can export its wallets then.
+    logError("group_export_check_failed", error, { groupId, userId });
+    return false;
+  }
+}
+
+/** Groups with wallets that this user may export, labelled with the group's title where Telegram still knows it. */
+async function exportableGroups(userId: number): Promise<Array<{ id: string; label: string }>> {
+  const wallets = [...(await listWallets("group_portal")), ...(await listWallets("group_evm"))];
+  const groups: Array<{ id: string; label: string }> = [];
+  for (const groupId of new Set(wallets.map((wallet) => wallet.scopeId))) {
+    if (!(await canExportGroupWallet(userId, groupId))) continue;
+    const chat = await bot.telegram.getChat(groupId).catch(() => undefined);
+    const title = chat && "title" in chat ? chat.title : undefined;
+    groups.push({ id: groupId, label: title ? `${title} (${groupId})` : groupId });
+  }
+  return groups;
+}
+
+async function sendGroupWalletExport(ctx: Context, userId: number, groupId: string): Promise<void> {
+  if (!(await canExportGroupWallet(userId, groupId))) {
+    await ctx.reply("Only the group's owner and admins can export its wallets.");
+    return;
+  }
+
+  try {
+    const exported = await exportWallets("group", groupId, requireAdmin(userId));
+    if (!exported.solana && !exported.robinhood) {
+      await ctx.reply("That group has no wallets yet.");
+      return;
+    }
+    audit(ctx, "wallet_export_group", undefined, {
+      groupId,
+      solana: exported.solana?.address,
+      robinhood: exported.robinhood?.address
+    });
+    await ctx.reply(walletExportMessage(`Group wallets for ${groupId}`, exported), telegramReplyOptions);
+  } catch (error) {
+    await ctx.reply(formatError(error), telegramReplyOptions);
+  }
 }
 
 async function safeAnswerCallback(ctx: Context, text: string): Promise<void> {
@@ -2959,84 +2938,9 @@ async function isBotAdmin(ctx: Context): Promise<boolean> {
   }
 }
 
-async function isGroupOwner(ctx: Context): Promise<boolean> {
-  const userId = ctx.from?.id;
-  if (requireAdmin(userId)) return true;
-  if (!userId) return false;
-
-  try {
-    return (await ctx.getChatMember(userId)).status === "creator";
-  } catch (error) {
-    logError("group_owner_check_failed", error, { chatId: ctx.chat?.id, fromId: userId });
-    return false;
-  }
-}
-
 async function canClaimFees(ctx: Context, scope: FeeClaimScope): Promise<boolean> {
   if (scope.kind === "user") return String(ctx.from?.id) === scope.id;
   return String(ctx.chat?.id) === scope.id && (await isBotAdmin(ctx));
-}
-
-function commandArgument(text: string): string {
-  return text.trim().split(/\s+/)[1] ?? "";
-}
-
-function payoutOverviewMessage(scope: FeeClaimScope, payouts: Partial<Record<FeeChain, string>>): string {
-  const show = (address?: string) => (address ? `<code>${escapeHtml(address)}</code>` : "not set");
-  return [
-    scope.kind === "group" ? "<b>Group payout wallets</b>" : "<b>Your payout wallets</b>",
-    "",
-    `Solana: ${show(payouts.solana)}`,
-    `Robinhood Chain: ${show(payouts.robinhood)}`,
-    "",
-    scope.kind === "group"
-      ? "Creator fees the group claims with <code>/claimfees</code> are sent here. Only the group owner can change them:"
-      : "Creator fees you claim with <code>/claimmyfees</code> are sent here. Change them with:",
-    `<code>${scope.kind === "group" ? "/setpayout" : "/setmypayout"} &lt;address&gt;</code>, using a Solana address or a 0x address for Robinhood Chain.`
-  ].join("\n");
-}
-
-async function askPayoutConfirmation(ctx: Context, scope: FeeClaimScope, rawAddress: string): Promise<void> {
-  if (!ctx.from) return;
-
-  let payout: { chain: FeeChain; address: string };
-  try {
-    payout = parsePayoutAddress(rawAddress);
-  } catch (error) {
-    await ctx.reply(formatError(error), telegramReplyOptions);
-    return;
-  }
-  // A launch wallet as payout would keep the fees in a hot wallet, which is what payouts exist to avoid.
-  if (await isLaunchWalletAddress(payout.address)) {
-    await ctx.reply("That's one of VoidLauncher's launch wallets. Use a wallet you control, like Phantom or MetaMask.");
-    return;
-  }
-
-  const nonce = crypto.randomBytes(6).toString("hex");
-  pendingPayouts.set(nonce, { scope, ...payout, userId: ctx.from.id, expiresAt: Date.now() + 10 * 60_000 });
-  await ctx.reply(
-    [
-      `<b>Set the ${chainLabel(payout.chain)} payout wallet?</b>`,
-      "",
-      `<code>${escapeHtml(payout.address)}</code>`,
-      "",
-      scope.kind === "group"
-        ? "Creator fees this group claims will be sent here."
-        : "Creator fees from your personal wallets will be sent here.",
-      "Check it carefully: fees sent to a wrong address can't be recovered."
-    ].join("\n"),
-    {
-      ...telegramReplyOptions,
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "Confirm", callback_data: `payout_ok:${nonce}` },
-            { text: "Cancel", callback_data: `payout_no:${nonce}` }
-          ]
-        ]
-      }
-    }
-  );
 }
 
 /** Posts a progress message, then replaces it with the fee card once the chains have been read. */
@@ -3048,7 +2952,7 @@ async function sendCreatorFeeStatus(ctx: Context, scope: FeeClaimScope): Promise
       const buttons: InlineKeyboardButton[][] = canClaim
         ? [
             [
-              { text: "Claim & send", callback_data: `claim_fees:${scope.kind}:${scope.id}` },
+              { text: "Claim fees", callback_data: `claim_fees:${scope.kind}:${scope.id}` },
               { text: "Cancel", callback_data: `claim_fees_cancel:${scope.kind}:${scope.id}` }
             ]
           ]
@@ -3068,18 +2972,14 @@ async function sendCreatorFeeStatus(ctx: Context, scope: FeeClaimScope): Promise
 
 async function runFeeClaim(ctx: Context, scope: FeeClaimScope): Promise<void> {
   try {
-    const outcomes = await claimCreatorFees(scope, {
-      chatId: ctx.chat?.id === undefined ? undefined : String(ctx.chat.id),
-      actorId: ctx.from?.id
-    });
+    const outcomes = await claimCreatorFees(scope);
     audit(ctx, "creator_fees_claimed", undefined, {
       scope: scope.kind,
       scopeId: scope.id,
       outcomes: outcomes.map((outcome) => ({
         chain: outcome.chain,
-        claimed: outcome.claimed.toString(),
-        sent: outcome.sent.toString(),
-        sendTx: outcome.sendTx,
+        wallet: outcome.wallet,
+        claims: outcome.claims.map((claim) => ({ launchpad: claim.launchpad, amount: claim.amount.toString(), tx: claim.tx })),
         errors: outcome.errors
       }))
     });
@@ -3242,15 +3142,13 @@ async function setupBotCommands(): Promise<void> {
     { command: "rhmywallet", description: "Create/show Robinhood personal wallet" },
     { command: "rhmybalance", description: "Check Robinhood personal wallet balance" },
     { command: "claimfees", description: "Claim the group's creator fees" },
-    { command: "setpayout", description: "Group owner: where claimed fees go" },
     { command: "claimmyfees", description: "Claim your personal creator fees" },
-    { command: "setmypayout", description: "Where your claimed fees go" },
     { command: "launchme", description: "Launch your own proposal" },
     { command: "feesettings", description: "Show proposal fee settings" },
     { command: "cashback", description: "Set Pump.fun cashback on/off" },
     { command: "setfees", description: "Set Pump.fun fee sharing" },
-    { command: "exportgroupwallet", description: "DM admin: export a group wallet" },
-    { command: "exportmywallet", description: "DM admin: export your personal wallet" },
+    { command: "exportgroupwallet", description: "DM: export a group's wallets (group admins)" },
+    { command: "exportmywallet", description: "DM: export your personal wallets" },
     { command: "launchcheck", description: "Check launch readiness" },
     { command: "status", description: "Admin status and recent launch attempts" },
     { command: "proposal", description: "Show a proposal by ID" },

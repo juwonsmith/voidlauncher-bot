@@ -1,11 +1,11 @@
 // Creator-fee claims for Robinhood Chain launch wallets on Pons. A coin's trading fees wait on its bonding curve until
 // someone sweeps them; a sweep credits the creator's share (70% of the 1% fee) to Pons' fee escrow, and claim() pays
-// it out in ETH. index.ts then forwards the ETH to the payout wallet.
-import { encodeFunctionData, getAddress, isAddress, keccak256, parseAbi, zeroAddress, type Hex } from "viem";
+// it out in ETH to the launch wallet.
+import { encodeFunctionData, getAddress, isAddress, parseAbi, zeroAddress, type Hex } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import { PONS_FACTORY } from "../launchpads/pons.js";
 import { ROBINHOOD_EXPLORER_URL, robinhoodPublicClient, robinhoodWalletClient } from "../launchpads/robinhoodChain.js";
-import { TransferNotSentError, type ClaimRun, type FeeClaimed } from "./types.js";
+import type { ClaimRun } from "./types.js";
 
 // docs.ponsfamily.com/docs/v2#contracts
 export const PONS_FEE_ESCROW = "0xd3AFEB2a57f70eF218Aa82451c51B2fb0416Ac9e" as const;
@@ -80,11 +80,7 @@ async function claimableAfterSweeps(client: Client, wallet: Hex, curves: Hex[]):
 }
 
 /** Sweeps the plan's curves, then claims the escrow into the launch wallet. */
-export async function claimPonsFees(
-  privateKey: Hex,
-  plan: PonsFeePlan,
-  onClaim: (claim: FeeClaimed) => Promise<void>
-): Promise<ClaimRun> {
+export async function claimPonsFees(privateKey: Hex, plan: PonsFeePlan): Promise<ClaimRun> {
   const run: ClaimRun = { claims: [], errors: [] };
   if (plan.amount === 0n) return run;
 
@@ -117,64 +113,11 @@ export async function claimPonsFees(
       "Pons fee claim"
     );
     // claim() pays out the whole escrow balance, which can only have grown since it was read.
-    const claim: FeeClaimed = { launchpad: "pons", amount: owed, tx };
-    run.claims.push(claim);
-    await onClaim(claim);
+    run.claims.push({ launchpad: "pons", amount: owed, tx });
   } catch (error) {
     run.errors.push(`Pons claim: ${evmErrorText(error, account.address)}`);
   }
   return run;
-}
-
-/**
- * Sends `wei` (or as much as the wallet can spare after gas) to the payout wallet. `onSigned` runs before the
- * broadcast so the caller can note the transaction hash first.
- */
-export async function forwardRobinhoodFees(
-  privateKey: Hex,
-  payoutAddress: string,
-  wei: bigint,
-  onSigned: (hash: string) => Promise<void>
-): Promise<{ tx: string; amount: bigint }> {
-  const account = privateKeyToAccount(privateKey);
-  const client = robinhoodPublicClient();
-  const walletClient = robinhoodWalletClient(account);
-  const to = getAddress(payoutAddress);
-
-  const [balance, draft] = await Promise.all([
-    client.getBalance({ address: account.address }),
-    walletClient.prepareTransactionRequest({ to, value: 1n })
-  ]).catch((error: unknown) => {
-    // Gas estimation fails outright when the wallet has no ETH at all.
-    throw new TransferNotSentError(evmErrorText(error, account.address));
-  });
-  const gasCost = draft.gas * (draft.maxFeePerGas ?? draft.gasPrice ?? 0n);
-  const amount = wei < balance - gasCost ? wei : balance - gasCost;
-  if (amount <= 0n) {
-    throw new TransferNotSentError(
-      `The Robinhood launch wallet can't cover the gas for the transfer. Send about 0.0005 ETH to ${account.address} and try again.`
-    );
-  }
-
-  const serialized = await walletClient.signTransaction({ ...draft, value: amount });
-  const hash = keccak256(serialized);
-  await onSigned(hash);
-  try {
-    await client.sendRawTransaction({ serializedTransaction: serialized });
-  } catch (error) {
-    throw new TransferNotSentError(`Transfer rejected: ${evmErrorText(error, account.address)}`);
-  }
-  const receipt = await client.waitForTransactionReceipt({ hash, timeout: 120_000 });
-  if (receipt.status !== "success") throw new Error(`Payout transfer reverted on-chain: ${ROBINHOOD_EXPLORER_URL}/tx/${hash}`);
-  return { tx: hash, amount };
-}
-
-export async function robinhoodTransferStatus(hash: string): Promise<"landed" | "failed" | "unknown"> {
-  const receipt = await robinhoodPublicClient()
-    .getTransactionReceipt({ hash: hash as Hex })
-    .catch(() => undefined);
-  if (!receipt) return "unknown";
-  return receipt.status === "success" ? "landed" : "failed";
 }
 
 /** Simulates first so a revert costs no gas, then sends and waits for the receipt. */

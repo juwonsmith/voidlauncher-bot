@@ -242,34 +242,6 @@ async function initializeDatabase(): Promise<void> {
     );
 
     CREATE INDEX IF NOT EXISTS idx_custom_ca_orders_status ON custom_ca_orders(status, proposal_id);
-
-    CREATE TABLE IF NOT EXISTS payout_wallets (
-      scope TEXT NOT NULL,
-      scope_id TEXT NOT NULL,
-      chain TEXT NOT NULL,
-      address TEXT NOT NULL,
-      set_by BIGINT,
-      updated_at TIMESTAMPTZ NOT NULL,
-      PRIMARY KEY (scope, scope_id, chain)
-    );
-
-    CREATE TABLE IF NOT EXISTS fee_claims (
-      id BIGSERIAL PRIMARY KEY,
-      chain TEXT NOT NULL,
-      wallet_address TEXT NOT NULL,
-      launchpad TEXT NOT NULL,
-      amount TEXT NOT NULL,
-      claim_tx TEXT NOT NULL,
-      chat_id TEXT,
-      actor_id BIGINT,
-      created_at TIMESTAMPTZ NOT NULL,
-      payout_address TEXT,
-      forward_tx TEXT,
-      forward_started_at TIMESTAMPTZ,
-      forwarded_at TIMESTAMPTZ
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_fee_claims_unforwarded ON fee_claims(wallet_address, id) WHERE forwarded_at IS NULL;
   `);
 }
 
@@ -536,65 +508,6 @@ function mapCustomCaOrder(row: QueryResultRow): CustomCaOrder {
   };
 }
 
-export type PayoutScope = "group" | "user";
-export type FeeChain = "solana" | "robinhood";
-
-/** A claim that landed in a launch wallet; forwarded once its transfer to the payout wallet confirms. */
-export interface FeeClaimRecord {
-  id: number;
-  chain: FeeChain;
-  walletAddress: string;
-  launchpad: string;
-  /** Lamports or wei. */
-  amount: bigint;
-  claimTx: string;
-  payoutAddress?: string;
-  forwardTx?: string;
-  forwardStartedAt?: string;
-}
-
-export interface FeeClaimInput {
-  chain: FeeChain;
-  walletAddress: string;
-  launchpad: string;
-  amount: bigint;
-  claimTx: string;
-  chatId?: string;
-  actorId?: number;
-}
-
-export async function getPayoutWallets(scope: PayoutScope, scopeId: string): Promise<Partial<Record<FeeChain, string>>> {
-  await databaseReady;
-  const result = await pool.query("SELECT chain, address FROM payout_wallets WHERE scope = $1 AND scope_id = $2", [
-    scope,
-    scopeId
-  ]);
-  return Object.fromEntries(result.rows.map((row) => [String(row.chain), String(row.address)]));
-}
-
-export async function setPayoutWallet(
-  scope: PayoutScope,
-  scopeId: string,
-  chain: FeeChain,
-  address: string,
-  setBy?: number
-): Promise<void> {
-  await databaseReady;
-  await pool.query(
-    `INSERT INTO payout_wallets (scope, scope_id, chain, address, set_by, updated_at)
-     VALUES ($1, $2, $3, $4, $5, NOW())
-     ON CONFLICT (scope, scope_id, chain) DO UPDATE SET address = EXCLUDED.address, set_by = EXCLUDED.set_by, updated_at = NOW()`,
-    [scope, scopeId, chain, address, setBy ?? null]
-  );
-}
-
-/** True for any wallet the bot itself holds, which must never be a payout wallet. */
-export async function isLaunchWalletAddress(address: string): Promise<boolean> {
-  await databaseReady;
-  const result = await pool.query("SELECT 1 FROM wallets WHERE lower(address) = lower($1) LIMIT 1", [address]);
-  return result.rows.length > 0;
-}
-
 /** Coins a wallet launched successfully on one launchpad, newest first. */
 export async function listLaunchedMints(payerAddress: string, launchpad: string): Promise<string[]> {
   await databaseReady;
@@ -606,67 +519,6 @@ export async function listLaunchedMints(payerAddress: string, launchpad: string)
     [payerAddress, launchpad]
   );
   return result.rows.map((row) => String(row.mint));
-}
-
-export async function recordFeeClaim(input: FeeClaimInput): Promise<void> {
-  await databaseReady;
-  await pool.query(
-    `INSERT INTO fee_claims (chain, wallet_address, launchpad, amount, claim_tx, chat_id, actor_id, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
-    [
-      input.chain,
-      input.walletAddress,
-      input.launchpad,
-      input.amount.toString(),
-      input.claimTx,
-      input.chatId ?? null,
-      input.actorId ?? null
-    ]
-  );
-}
-
-export async function listUnforwardedFeeClaims(walletAddress: string): Promise<FeeClaimRecord[]> {
-  await databaseReady;
-  const result = await pool.query(
-    "SELECT * FROM fee_claims WHERE wallet_address = $1 AND forwarded_at IS NULL ORDER BY id",
-    [walletAddress]
-  );
-  return result.rows.map((row) => ({
-    id: Number(row.id),
-    chain: String(row.chain) as FeeChain,
-    walletAddress: String(row.wallet_address),
-    launchpad: String(row.launchpad),
-    amount: BigInt(String(row.amount)),
-    claimTx: String(row.claim_tx),
-    payoutAddress: row.payout_address ? String(row.payout_address) : undefined,
-    forwardTx: row.forward_tx ? String(row.forward_tx) : undefined,
-    forwardStartedAt: row.forward_started_at ? asIso(row.forward_started_at) : undefined
-  }));
-}
-
-/** Notes the transfer before it is broadcast, so a crash mid-send can't lead to sending the same fees twice. */
-export async function markFeeClaimsForwarding(ids: number[], payoutAddress: string, forwardTx: string): Promise<void> {
-  await databaseReady;
-  await pool.query(
-    `UPDATE fee_claims SET payout_address = $2, forward_tx = $3, forward_started_at = NOW()
-     WHERE id = ANY($1::bigint[]) AND forwarded_at IS NULL`,
-    [ids, payoutAddress, forwardTx]
-  );
-}
-
-export async function markFeeClaimsForwarded(ids: number[]): Promise<void> {
-  await databaseReady;
-  await pool.query("UPDATE fee_claims SET forwarded_at = NOW() WHERE id = ANY($1::bigint[]) AND forwarded_at IS NULL", [ids]);
-}
-
-/** Frees claims whose transfer never landed so the next run sends them again. */
-export async function clearFeeClaimsForwarding(ids: number[]): Promise<void> {
-  await databaseReady;
-  await pool.query(
-    `UPDATE fee_claims SET payout_address = NULL, forward_tx = NULL, forward_started_at = NULL
-     WHERE id = ANY($1::bigint[]) AND forwarded_at IS NULL`,
-    [ids]
-  );
 }
 
 export async function markLaunched(id: number, signature?: string): Promise<Proposal | undefined> {

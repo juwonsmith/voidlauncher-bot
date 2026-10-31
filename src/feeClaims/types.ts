@@ -12,6 +12,3 @@ export interface ClaimRun {
   claims: FeeClaimed[];
   errors: string[];
 }
-
-/** Thrown when a transfer was never broadcast, so its claims can be sent again right away. */
-export class TransferNotSentError extends Error {}
