@@ -1,4 +1,5 @@
 import {
+  ComputeBudgetProgram,
   Connection,
   Keypair,
   LAMPORTS_PER_SOL,
@@ -516,20 +517,18 @@ async function sendPumpFunSdkCreateRequest(
         amount: tokenAmount
       });
 
-  const transaction = new Transaction().add(...(createInstructions as Parameters<Transaction["add"]>));
-  transaction.feePayer = signerKeypair.publicKey;
-  const latestBlockhash = await connection.getLatestBlockhash("confirmed");
-  transaction.recentBlockhash = latestBlockhash.blockhash;
-  transaction.sign(signerKeypair, mintSigner);
-
-  const simulation = await connection.simulateTransaction(transaction);
-  if (simulation.value.err) {
-    throw new NonRetryableLaunchError(
-      `Pump.fun SDK simulation failed: ${JSON.stringify(simulation.value.err)}${
-        simulation.value.logs?.length ? ` | logs: ${simulation.value.logs.slice(-8).join(" | ")}` : ""
-      }`
-    );
-  }
+  const { transaction, latestBlockhash, priorityFee } = await preparePumpFunCreateTransaction(
+    connection,
+    createInstructions as Parameters<Transaction["add"]>,
+    signerKeypair,
+    mintSigner,
+    priorityFeeForLaunchpad(proposal.launchpad)
+  );
+  console.log(
+    priorityFee
+      ? `[launch:${proposal.id}] priority fee ${priorityFee.sol} SOL (${priorityFee.microLamports} microLamports/CU, limit ${priorityFee.unitLimit} CU)`
+      : `[launch:${proposal.id}] no room for a priority fee in this create transaction; sending without one`
+  );
 
   const signature = await connection.sendRawTransaction(transaction.serialize(), {
     maxRetries: 3,
@@ -552,6 +551,73 @@ async function sendPumpFunSdkCreateRequest(
   }
 
   return signature;
+}
+
+const MAX_TRANSACTION_BYTES = 1232;
+
+export interface PreparedCreateTransaction {
+  transaction: Transaction;
+  latestBlockhash: { blockhash: string; lastValidBlockHeight: number };
+  priorityFee?: { sol: number; microLamports: number; unitLimit: number };
+}
+
+/**
+ * Builds, signs and simulates the Pump.fun create+buy transaction, adding a priority fee when it fits in
+ * Solana's 1,232-byte limit. Classic creates have room for it; cashback (createV2) creates do not, so they
+ * go out without one.
+ */
+export async function preparePumpFunCreateTransaction(
+  connection: Connection,
+  instructions: Parameters<Transaction["add"]>,
+  feePayer: Keypair,
+  mintSigner: Keypair,
+  priorityFeeSol: number
+): Promise<PreparedCreateTransaction> {
+  const latestBlockhash = await connection.getLatestBlockhash("confirmed");
+  const build = (...computeBudget: Parameters<Transaction["add"]>) => {
+    const transaction = new Transaction().add(...computeBudget, ...instructions);
+    transaction.feePayer = feePayer.publicKey;
+    transaction.recentBlockhash = latestBlockhash.blockhash;
+    return transaction;
+  };
+
+  const base = build();
+  const baseSize = signedSize(base);
+  if (baseSize > MAX_TRANSACTION_BYTES) {
+    throw new NonRetryableLaunchError(
+      `Pump.fun create transaction is ${baseSize} bytes, over Solana's ${MAX_TRANSACTION_BYTES}-byte limit. ` +
+        "Shorten the coin name or ticker, or turn cashback off."
+    );
+  }
+  base.sign(feePayer, mintSigner);
+
+  const simulation = await connection.simulateTransaction(base);
+  if (simulation.value.err) {
+    throw new NonRetryableLaunchError(
+      `Pump.fun SDK simulation failed: ${JSON.stringify(simulation.value.err)}${
+        simulation.value.logs?.length ? ` | logs: ${simulation.value.logs.slice(-8).join(" | ")}` : ""
+      }`
+    );
+  }
+
+  // A limit just above the simulated usage (~190k CU) buys more priority per unit for the same fee.
+  const unitsConsumed = simulation.value.unitsConsumed;
+  const unitLimit = unitsConsumed ? Math.min(1_400_000, Math.ceil(unitsConsumed * 1.1) + 1_000) : 450_000;
+  const microLamports = Math.ceil((priorityFeeSol * LAMPORTS_PER_SOL * 1_000_000) / unitLimit);
+  const prioritized = build(
+    ComputeBudgetProgram.setComputeUnitLimit({ units: unitLimit }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports })
+  );
+  if (signedSize(prioritized) > MAX_TRANSACTION_BYTES) return { transaction: base, latestBlockhash };
+
+  prioritized.sign(feePayer, mintSigner);
+  return { transaction: prioritized, latestBlockhash, priorityFee: { sol: priorityFeeSol, microLamports, unitLimit } };
+}
+
+/** Wire size once signed: a 1-byte signature count, 64 bytes per required signature, then the message. */
+function signedSize(transaction: Transaction): number {
+  const message = transaction.compileMessage();
+  return 1 + message.header.numRequiredSignatures * 64 + message.serialize().length;
 }
 
 async function configurePumpFunFeeSharingIfEnabled(
