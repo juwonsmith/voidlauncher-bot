@@ -174,7 +174,9 @@ export function commandHelpMessage(): string {
     "<code>/exportgroupwallet &lt;group_id&gt;</code> - export a specific group wallet",
     "<code>/exportmywallet</code> - export your personal wallet",
     "",
-    "Supported launchpads: <b>Pump.fun</b>, <b>Bonk</b>, <b>Bags</b>, and <b>Robinhood Chain</b>."
+    `Supported launchpads: <b>Pump.fun</b>, <b>Bonk</b>, <b>Bags</b>, and <b>Robinhood Chain</b> (via ${
+      config.ROBINHOOD_LAUNCHPAD === "bags" ? "Bags" : "Pons"
+    }).`
   ].join("\n");
 }
 
@@ -263,7 +265,11 @@ function launchLinks(mint: string, launchpad: Proposal["launchpad"]): string[] {
   } else if (launchpad === "bags") {
     links.push(`<a href="https://bags.fm/token/${encodedMint}">Bags</a>`);
   } else if (launchpad === "robinhood") {
-    links.push(`<a href="https://bags.fm/token/${encodedMint}">Bags</a>`);
+    links.push(
+      config.ROBINHOOD_LAUNCHPAD === "bags"
+        ? `<a href="https://bags.fm/token/${encodedMint}">Bags</a>`
+        : `<a href="https://www.ponsfamily.com/launchpad/${encodedMint}">Pons</a>`
+    );
     links.push(`<a href="https://robinhoodchain.blockscout.com/token/${encodedMint}">Token</a>`);
     return links;
   }

@@ -126,6 +126,8 @@ Guided flow:
 The bot will ask for launchpad, name, ticker, description, optional links, image/logo, dev buy, then show a preview with submit/cancel buttons.
 The image/logo step is required because launch metadata needs an image. Bags launches are available through Launch Group and require `BAGS_API_KEY`.
 
+Robinhood Chain launches go to [Pons](https://www.ponsfamily.com/launchpad), the busiest launchpad on that chain, using the group's or your personal Robinhood wallet (`/rhgroupwallet`, `/rhmywallet`). Pons charges a 0.0005 ETH launch fee, read live before each launch, and gives the creator 70% of its 1% trading fee. The logo is uploaded to IPFS through Pinata, and the name, description and links go into the launch transaction itself. Set `ROBINHOOD_LAUNCHPAD=bags` to launch Robinhood proposals on Bags' Robinhood Chain contracts instead.
+
 Fast image flow:
 
 ```text

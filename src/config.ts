@@ -31,6 +31,8 @@ const envSchema = z.object({
   PINATA_JWT: z.string().optional(),
   SOLANA_RPC_URL: z.string().default("https://api.mainnet-beta.solana.com"),
   ROBINHOOD_RPC_URL: z.string().default("https://rpc.mainnet.chain.robinhood.com"),
+  // Launchpad for Robinhood Chain proposals: Pons (where most Robinhood Chain launches happen) or Bags as a backup.
+  ROBINHOOD_LAUNCHPAD: z.enum(["pons", "bags"]).default("pons"),
   ROBINHOOD_PLATFORM_TREASURY_WALLET: z.string().default(""),
   ROBINHOOD_PLATFORM_FEE_ETH: z.coerce.number().min(0).default(0),
   DEFAULT_DEV_BUY_ETH: z.coerce.number().min(0).default(0.01),

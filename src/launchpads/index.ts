@@ -1,8 +1,9 @@
 import { config } from "../config.js";
 import type { LaunchResult, Proposal } from "../types.js";
 import { launchWithBags } from "./bags.js";
+import { launchWithPons, readPonsLaunchFeeEth } from "./pons.js";
 import { launchWithPumpPortal } from "./pumpportal.js";
-import { launchWithRobinhoodBags } from "./robinhood.js";
+import { launchWithRobinhoodBags, readBagsCreationFeeEth } from "./robinhood.js";
 
 export async function launchProposal(proposal: Proposal): Promise<LaunchResult> {
   if (config.DRY_RUN) {
@@ -31,4 +32,22 @@ export async function launchProposal(proposal: Proposal): Promise<LaunchResult> 
   throw new Error(`Unsupported launchpad: ${proposal.launchpad}`);
 }
 
-export { launchWithRobinhoodBags };
+/** Robinhood Chain proposals launch on Pons unless ROBINHOOD_LAUNCHPAD=bags. */
+export function robinhoodLaunchpadName(): "Pons" | "Bags" {
+  return config.ROBINHOOD_LAUNCHPAD === "bags" ? "Bags" : "Pons";
+}
+
+export function launchOnRobinhood(
+  proposal: Proposal,
+  privateKey: `0x${string}`,
+  expectedAddress?: string
+): Promise<LaunchResult> {
+  return config.ROBINHOOD_LAUNCHPAD === "bags"
+    ? launchWithRobinhoodBags(proposal, privateKey, expectedAddress)
+    : launchWithPons(proposal, privateKey, expectedAddress);
+}
+
+/** The selected Robinhood launchpad's current launch fee in ETH, read live. */
+export function readRobinhoodLaunchFeeEth(): Promise<number> {
+  return config.ROBINHOOD_LAUNCHPAD === "bags" ? readBagsCreationFeeEth() : readPonsLaunchFeeEth();
+}

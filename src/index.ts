@@ -36,9 +36,8 @@ import {
   assertDatabaseReady,
   closeDatabase
 } from "./db.js";
-import { launchProposal } from "./launchpads/index.js";
+import { launchOnRobinhood, launchProposal, readRobinhoodLaunchFeeEth, robinhoodLaunchpadName } from "./launchpads/index.js";
 import { launchWithBags } from "./launchpads/bags.js";
-import { launchWithRobinhoodBags, readRobinhoodCreationFeeEth } from "./launchpads/robinhood.js";
 import {
   launchWithPumpFunSdk,
   launchWithPumpPortalApiKey,
@@ -1298,10 +1297,10 @@ async function sendLaunchConfirmation(ctx: Context, mode: LaunchMode, id: number
         "",
         `<b>${escapeHtml(proposal.name)}</b> | <code>$${escapeHtml(proposal.symbol)}</code>`,
         `Mode: <b>${mode === "api" ? "API" : mode === "group" ? "Group Wallet" : "Personal Wallet"}</b>`,
-        "Launchpad: <b>Robinhood Chain / Bags</b>",
+        `Launchpad: <b>Robinhood Chain / ${robinhoodLaunchpadName()}</b>`,
         "",
         `Initial buy: <b>${cost.devBuyEth} ETH</b>`,
-        `Bags creation fee: <b>${cost.creationFeeEth === undefined ? "couldn't be read right now" : `${cost.creationFeeEth} ETH`}</b>`,
+        `${robinhoodLaunchpadName()} launch fee: <b>${cost.launchFeeEth === undefined ? "couldn't be read right now" : `${cost.launchFeeEth} ETH`}</b>`,
         cost.platformFeeEth > 0 ? `Platform fee: <b>${cost.platformFeeEth} ETH</b>` : `Platform fee: <b>off</b>`,
         `Suggested wallet minimum: <b>${cost.minimumEth.toFixed(6)} ETH</b> (includes gas)`,
         "",
@@ -1416,7 +1415,7 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
             }.`
           }
         : proposal.launchpad === "robinhood"
-          ? await launchWithRobinhoodBags(
+          ? await launchOnRobinhood(
               proposal,
               (await getRobinhoodWalletSecret("group", String(chatId))).privateKey,
               robinhoodWallet?.address
@@ -1502,7 +1501,7 @@ async function runPersonalLaunch(ctx: Context, id: number): Promise<void> {
             message: `Dry run only. Would launch ${proposal.name} ($${proposal.symbol}) from personal wallet ${wallet.address}.`
           }
         : proposal.launchpad === "robinhood"
-          ? await launchWithRobinhoodBags(
+          ? await launchOnRobinhood(
               proposal,
               (await getRobinhoodWalletSecret("user", String(ctx.from!.id))).privateKey,
               wallet.address
@@ -1652,7 +1651,7 @@ async function runQueuedLaunch(
         : undefined;
     let result =
       proposal.launchpad === "robinhood"
-        ? await launchWithRobinhoodBags(
+        ? await launchOnRobinhood(
             proposal,
             (await getRobinhoodWalletSecret("group", chatId)).privateKey,
             robinhoodWallet?.address
@@ -1681,7 +1680,7 @@ async function runQueuedLaunch(
   if (!actorId) throw new Error("Personal launch job is missing actor id.");
   if (proposal.launchpad === "robinhood") {
     const wallet = await getOrCreateRobinhoodWallet("user", String(actorId));
-    return launchWithRobinhoodBags(
+    return launchOnRobinhood(
       proposal,
       (await getRobinhoodWalletSecret("user", String(actorId))).privateKey,
       wallet.address
@@ -1848,21 +1847,26 @@ async function assertPersonalLaunchReady(proposal: Proposal, walletAddress: stri
 
 // A Robinhood launch uses ~1.7M gas, about 0.00004 ETH at recent prices; this covers spikes and the fee transfer.
 const ROBINHOOD_GAS_BUFFER_ETH = 0.001;
-// Only used when the live creation fee can't be read: Bags' documented 0.02 ETH default plus gas.
+// Only used when the live launch fee can't be read: covers Bags' documented 0.02 ETH default plus gas, and far
+// more than Pons' 0.0005 ETH.
 const ROBINHOOD_FALLBACK_FEE_AND_GAS_ETH = 0.025;
 
-/** What a Robinhood launch needs in the wallet: Bags' live creation fee, the initial buy, the platform fee and gas. */
+/** What a Robinhood launch needs in the wallet: the launchpad's live fee, the initial buy, the platform fee and gas. */
 async function robinhoodLaunchCost(
   proposal: Proposal
-): Promise<{ creationFeeEth?: number; devBuyEth: number; platformFeeEth: number; minimumEth: number }> {
+): Promise<{ launchFeeEth?: number; devBuyEth: number; platformFeeEth: number; minimumEth: number }> {
   const devBuyEth = proposal.devBuyEth ?? config.DEFAULT_DEV_BUY_ETH;
   const platformFeeEth = config.ROBINHOOD_PLATFORM_FEE_ETH > 0 ? config.ROBINHOOD_PLATFORM_FEE_ETH : 0;
-  const creationFeeEth = await readRobinhoodCreationFeeEth().catch((error) => {
-    console.warn(`[preflight:${proposal.id}] could not read the Bags creation fee: ${error instanceof Error ? error.message : String(error)}`);
+  const launchFeeEth = await readRobinhoodLaunchFeeEth().catch((error: unknown) => {
+    console.warn(
+      `[preflight:${proposal.id}] could not read the ${robinhoodLaunchpadName()} launch fee: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
     return undefined;
   });
-  const feeAndGasEth = creationFeeEth === undefined ? ROBINHOOD_FALLBACK_FEE_AND_GAS_ETH : creationFeeEth + ROBINHOOD_GAS_BUFFER_ETH;
-  return { creationFeeEth, devBuyEth, platformFeeEth, minimumEth: devBuyEth + platformFeeEth + feeAndGasEth };
+  const feeAndGasEth = launchFeeEth === undefined ? ROBINHOOD_FALLBACK_FEE_AND_GAS_ETH : launchFeeEth + ROBINHOOD_GAS_BUFFER_ETH;
+  return { launchFeeEth, devBuyEth, platformFeeEth, minimumEth: devBuyEth + platformFeeEth + feeAndGasEth };
 }
 
 async function assertRobinhoodLaunchReady(proposal: Proposal, walletAddress: string, mode: "group" | "personal"): Promise<void> {

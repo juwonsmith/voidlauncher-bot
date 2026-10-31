@@ -36,6 +36,19 @@ export async function uploadMetadataToPinata(proposal: Proposal, label: string):
   return uploadBlobToPinata(file);
 }
 
+/** Uploads only the proposal's image (validated) and returns its IPFS gateway URL. */
+export async function uploadImageToPinata(proposal: Proposal, label: string): Promise<string> {
+  if (!config.PINATA_JWT) {
+    throw new Error("PINATA_JWT is required for IPFS image uploads.");
+  }
+  if (!proposal.image) {
+    throw new Error("An image URL is required for launch metadata.");
+  }
+
+  console.log(`[launch:${proposal.id}] downloading/uploading ${label} image to Pinata`);
+  return uploadFileToPinata(proposal.image, `${proposal.symbol}-${label}-image`);
+}
+
 async function uploadFileToPinata(url: string, fallbackName: string): Promise<string> {
   const file = await fetchFile(url, fallbackName);
   const validatedImage = await validateImageFile(file);

@@ -1,39 +1,18 @@
-import {
-  createPublicClient,
-  createWalletClient,
-  defineChain,
-  formatEther,
-  getAddress,
-  http,
-  isAddress,
-  parseEther,
-  parseEventLogs,
-  zeroAddress,
-  type Address,
-  type Log
-} from "viem";
+// Bags launches on Robinhood Chain: the backup Robinhood launchpad, used when ROBINHOOD_LAUNCHPAD=bags.
+import { formatEther, getAddress, parseEther, parseEventLogs, zeroAddress, type Address, type Log } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { config } from "../config.js";
 import type { LaunchResult, Proposal } from "../types.js";
 import { uploadMetadataToPinata } from "./metadata.js";
+import {
+  ROBINHOOD_EXPLORER_URL,
+  robinhoodPublicClient,
+  robinhoodWalletClient,
+  sendRobinhoodPlatformFee
+} from "./robinhoodChain.js";
 
 const ROBINHOOD_FACTORY = "0xe8Cc4431adF8b5A847C113EF0c6af9043219Cb37" as const;
 const TOTAL_BPS = 10_000;
-
-const robinhoodChain = defineChain({
-  id: 4663,
-  name: "Robinhood Chain",
-  nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-  rpcUrls: {
-    default: { http: [config.ROBINHOOD_RPC_URL] }
-  },
-  blockExplorers: {
-    default: { name: "Blockscout", url: "https://robinhoodchain.blockscout.com" }
-  },
-  contracts: {
-    multicall3: { address: "0xcA11bde05977b3631167028862bE2a173976CA11" }
-  }
-});
 
 const bagsFactoryAbi = [
   {
@@ -95,17 +74,8 @@ const bagsFactoryAbi = [
   }
 ] as const;
 
-function robinhoodPublicClient() {
-  return createPublicClient({
-    chain: robinhoodChain,
-    transport: http(config.ROBINHOOD_RPC_URL, { batch: true }),
-    batch: { multicall: true },
-    pollingInterval: 500
-  });
-}
-
 /** Bags' current creation fee in ETH. The factory owner can change it, so read it per launch. */
-export async function readRobinhoodCreationFeeEth(): Promise<number> {
+export async function readBagsCreationFeeEth(): Promise<number> {
   const fee = await robinhoodPublicClient().readContract({
     address: ROBINHOOD_FACTORY,
     abi: bagsFactoryAbi,
@@ -134,11 +104,7 @@ export async function launchWithRobinhoodBags(
   }
 
   const publicClient = robinhoodPublicClient();
-  const walletClient = createWalletClient({
-    account,
-    chain: robinhoodChain,
-    transport: http(config.ROBINHOOD_RPC_URL, { batch: true })
-  });
+  const walletClient = robinhoodWalletClient(account);
 
   console.log(`[launch:${proposal.id}] preparing Robinhood Chain metadata`);
   const metadataUri = await uploadMetadataToPinata(proposal, "robinhood");
@@ -150,7 +116,6 @@ export async function launchWithRobinhoodBags(
     functionName: "creationFee"
   });
   const initialBuyWei = parseEther(String(proposal.devBuyEth ?? config.DEFAULT_DEV_BUY_ETH));
-  const platformFeeWei = config.ROBINHOOD_PLATFORM_FEE_ETH > 0 ? parseEther(String(config.ROBINHOOD_PLATFORM_FEE_ETH)) : 0n;
   const args = [
     proposal.name,
     proposal.symbol,
@@ -182,20 +147,7 @@ export async function launchWithRobinhoodBags(
   const created = findTokenCreated(receipt.logs);
   if (!created) console.warn(`[launch:${proposal.id}] Robinhood launch ${hash} succeeded but TokenCreated did not decode`);
 
-  let platformFeeUrl: string | undefined;
-  let platformFeeError: string | undefined;
-  if (platformFeeWei > 0n && config.ROBINHOOD_PLATFORM_TREASURY_WALLET) {
-    if (!isAddress(config.ROBINHOOD_PLATFORM_TREASURY_WALLET)) {
-      platformFeeError = "ROBINHOOD_PLATFORM_TREASURY_WALLET is not a valid EVM address.";
-    } else {
-      const feeHash = await walletClient.sendTransaction({
-        account,
-        to: getAddress(config.ROBINHOOD_PLATFORM_TREASURY_WALLET),
-        value: platformFeeWei
-      });
-      platformFeeUrl = `https://robinhoodchain.blockscout.com/tx/${feeHash}`;
-    }
-  }
+  const platformFee = await sendRobinhoodPlatformFee(walletClient);
 
   return {
     launchpad: "robinhood",
@@ -204,10 +156,10 @@ export async function launchWithRobinhoodBags(
     curve: created?.curve as Address | undefined,
     feeShare: created?.feeShare as Address | undefined,
     signature: hash,
-    explorerUrl: `https://robinhoodchain.blockscout.com/tx/${hash}`,
+    explorerUrl: `${ROBINHOOD_EXPLORER_URL}/tx/${hash}`,
     metadataUri,
-    platformFeeUrl,
-    platformFeeError,
+    platformFeeUrl: platformFee.url,
+    platformFeeError: platformFee.error,
     message: created
       ? `Launched ${proposal.name} ($${proposal.symbol}) on Robinhood Chain.`
       : `Launched ${proposal.name} ($${proposal.symbol}) on Robinhood Chain. The bot couldn't read the new token's address, ` +
