@@ -16,7 +16,8 @@
     "vanity:pump": "node scripts/run-vanity-worker.mjs pump",
     "vanity:bonk": "node scripts/run-vanity-worker.mjs bonk",
     "vanity:bags": "node scripts/run-vanity-worker.mjs bags",
-    "vanity:all": "node scripts/run-all-vanity-workers.mjs"
+    "vanity:all": "node scripts/run-all-vanity-workers.mjs",
+    "vanity:custom": "node scripts/run-custom-ca-worker.mjs"
   },
   "dependencies": {
     "@bagsfm/bags-sdk": "^1.3.7",

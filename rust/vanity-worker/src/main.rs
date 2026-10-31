@@ -17,6 +17,7 @@ struct Mint {
 #[derive(Debug, Clone)]
 struct Config {
     database_path: String,
+    prefix: String,
     suffix: String,
     pool_size: usize,
     workers: usize,
@@ -34,7 +35,7 @@ fn main() {
         }
     };
 
-    if config.suffix.is_empty() {
+    if config.prefix.is_empty() && config.suffix.is_empty() {
         eprintln!("PUMP_MINT_SUFFIX is empty. Set PUMP_MINT_SUFFIX=pump to fill a vanity pool.");
         std::process::exit(1);
     }
@@ -44,7 +45,8 @@ fn main() {
     }
 
     println!(
-        "Vanity worker started: suffix={} pool_size={} workers={} storage={}",
+        "Vanity worker started: prefix={} suffix={} pool_size={} workers={} storage={}",
+        config.prefix,
         config.suffix,
         config.pool_size,
         config.workers,
@@ -56,6 +58,7 @@ fn main() {
 
     for _ in 0..config.workers {
         let sender = sender.clone();
+        let prefix = config.prefix.clone();
         let suffix = config.suffix.clone();
         let attempts = Arc::clone(&attempts);
 
@@ -65,7 +68,7 @@ fn main() {
             let address = bs58::encode(verifying_key.as_bytes()).into_string();
             attempts.fetch_add(1, Ordering::Relaxed);
 
-            if address.ends_with(&suffix) {
+            if address.starts_with(&prefix) && address.ends_with(&suffix) {
                 let mut secret = [0u8; 64];
                 secret[..32].copy_from_slice(&signing_key.to_bytes());
                 secret[32..].copy_from_slice(verifying_key.as_bytes());
@@ -139,9 +142,18 @@ fn main() {
 
 fn read_config() -> Result<Config, String> {
     let database_path = env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/bot.sqlite".to_string());
-    let suffix = env::var("VANITY_MINT_SUFFIX")
-        .or_else(|_| env::var("PUMP_MINT_SUFFIX"))
-        .unwrap_or_else(|_| "pump".to_string());
+    let custom_order = env::var("VANITY_CUSTOM_ORDER")
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let prefix = env::var("VANITY_MINT_PREFIX").unwrap_or_default();
+    let suffix = if custom_order {
+        // A custom CA order sets exactly the pattern it wants; never fall back to the pool suffix.
+        env::var("VANITY_MINT_SUFFIX").unwrap_or_default()
+    } else {
+        env::var("VANITY_MINT_SUFFIX")
+            .or_else(|_| env::var("PUMP_MINT_SUFFIX"))
+            .unwrap_or_else(|_| "pump".to_string())
+    };
     let pool_size = env::var("PUMP_MINT_POOL_SIZE")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -156,6 +168,7 @@ fn read_config() -> Result<Config, String> {
 
     Ok(Config {
         database_path,
+        prefix,
         suffix,
         pool_size,
         workers,

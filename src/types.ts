@@ -14,6 +14,9 @@ export interface CoinIdeaInput {
   devBuyEth?: number;
   pumpfunCashback?: boolean;
   pumpfunFeeShares?: string;
+  customCaPosition?: "start" | "end";
+  customCaPattern?: string;
+  customCaFeeSol?: number;
 }
 
 export interface Proposal extends CoinIdeaInput {

@@ -75,6 +75,13 @@ const envSchema = z.object({
   HEALTHCHECK_PORT: z.coerce.number().int().min(0).default(0),
   LOG_DIR: z.string().default("./logs"),
   WALLET_ENCRYPTION_KEY: z.string().optional(),
+  // Custom CA orders: "length:fee" pairs in SOL, e.g. "3:0.05,4:0.1". Empty turns the feature off.
+  CUSTOM_CA_FEES_SOL: z.string().default(""),
+  // Grinder speed used for wait estimates; measured ~40k/s on a 4-core PC with the Rust worker.
+  CUSTOM_CA_KEYS_PER_SECOND: z.coerce.number().positive().default(40_000),
+  CUSTOM_CA_MAX_WAIT_MINUTES: z.coerce.number().positive().default(60),
+  // Shared secret the grinder sends to /grinder/* on the health server. At least 24 characters.
+  GRINDER_API_TOKEN: z.string().optional(),
   // Render sets RENDER=true on every service; its filesystem is wiped on each restart and deploy.
   RENDER: z
     .string()

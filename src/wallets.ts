@@ -348,6 +348,15 @@ function robinhoodStorageScope(scope: "group" | "user"): WalletScope {
   return scope === "group" ? "group_evm" : "user_evm";
 }
 
+/** Custom CA mint secrets are encrypted with the same key as the wallets. */
+export function encryptMintSecret(secretKeyBase58: string): string {
+  return encryptSecret(secretKeyBase58);
+}
+
+export function decryptMintSecret(encryptedSecret: string): string {
+  return decryptSecretString(encryptedSecret);
+}
+
 /** Fails startup instead of silently creating a key that a redeploy would throw away. */
 export function assertWalletEncryptionKeyReady(): void {
   if (config.WALLET_ENCRYPTION_KEY) {

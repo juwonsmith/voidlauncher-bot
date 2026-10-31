@@ -72,6 +72,11 @@ export function proposalMessage(proposal: Proposal, heading = "New Coin Idea"): 
     proposal.launchpad === "pumpfun"
       ? `&#129309; Fee Share: <b>${feeShareLabel(proposal.pumpfunFeeShares)}</b>`
       : undefined,
+    proposal.customCaPattern
+      ? `&#129689; Custom CA: <b>${proposal.customCaPosition === "start" ? "starts" : "ends"} with ${escapeHtml(
+          proposal.customCaPattern
+        )}</b> (+${proposal.customCaFeeSol ?? 0} SOL at launch)`
+      : undefined,
     "",
     
     `&#128221; ${escapeHtml(proposal.description)}`,

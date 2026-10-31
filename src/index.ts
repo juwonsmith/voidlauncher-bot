@@ -13,6 +13,12 @@ import {
   claimNextLaunchJob,
   nextLaunchJobRunAt,
   completeLaunchJob,
+  cancelCustomCaOrder,
+  createCustomCaOrder,
+  fulfillCustomCaOrder,
+  getCustomCaOrder,
+  listPendingCustomCaOrders,
+  type CustomCaOrder,
   createProposal,
   enqueueLaunchJob,
   failLaunchJob,
@@ -75,10 +81,31 @@ import {
   getWalletSummary,
   getWalletView,
   assertWalletEncryptionKeyReady,
+  encryptMintSecret,
   type WalletView
 } from "./wallets.js";
 import { logError, logInfo } from "./logger.js";
 import { createLaunchJobWorker } from "./launchJobWorker.js";
+import {
+  customCaFeeSol,
+  customCaKeypairProblem,
+  describeCustomCa,
+  expectedAttempts,
+  formatSearchTime,
+  normalizeCustomCaPattern,
+  parseCustomCaFees,
+  quoteCustomCa,
+  type CustomCaPosition,
+  type CustomCaPricing,
+  type CustomCaRequest
+} from "./customCa.js";
+import {
+  grinderApiEnabled,
+  handleGrinderRequest,
+  type GrinderApi,
+  type GrinderOrder,
+  type GrinderSubmitResult
+} from "./grinderApi.js";
 
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
 const drafts = new Map<string, Draft>();
@@ -93,6 +120,19 @@ const launchJobWorker = createLaunchJobWorker({
   nextRunAt: () => nextLaunchJobRunAt(config.LAUNCH_JOB_MAX_ATTEMPTS),
   onError: (error) => logError("launch_job_worker_failed", error)
 });
+const customCaPricing: CustomCaPricing = {
+  feesByLength: parseCustomCaFees(config.CUSTOM_CA_FEES_SOL),
+  keysPerSecond: config.CUSTOM_CA_KEYS_PER_SECOND,
+  maxWaitMinutes: config.CUSTOM_CA_MAX_WAIT_MINUTES
+};
+const customCaEnabled = customCaPricing.feesByLength.size > 0 && grinderApiEnabled(config.GRINDER_API_TOKEN);
+// Orders waiting for the grinder. Kept in memory so grinder polls never wake the database.
+const pendingCustomCaOrders = new Map<number, GrinderOrder>();
+const grinderApi: GrinderApi = {
+  token: config.GRINDER_API_TOKEN,
+  pendingOrders: () => [...pendingCustomCaOrders.values()],
+  submitResult: storeCustomCaResult
+};
 
 type DraftStep =
   | "launchpad"
@@ -108,6 +148,8 @@ type DraftStep =
   | "feeShares"
   | "feeShareWallet"
   | "feeSharePercent"
+  | "customCa"
+  | "customCaText"
   | "preview";
 
 interface Draft {
@@ -115,6 +157,7 @@ interface Draft {
   data: Partial<CoinIdeaInput>;
   promptMessageId?: number;
   customFeeWallet?: string;
+  customCaPosition?: CustomCaPosition;
   forcedStep?: DraftStep;
 }
 
@@ -623,6 +666,7 @@ bot.command("reject", async (ctx) => {
 
   const proposal = await rejectProposal(id, reason);
   if (!proposal) return ctx.reply(`Proposal #${id} not found.`);
+  await cancelCustomCaIfRejected(proposal);
   audit(ctx, "proposal_rejected", id, { reason });
 
   return ctx.reply(`❌ <b>Rejected proposal #${id}</b>\n${escapeHtml(reason)}`, telegramReplyOptions);
@@ -722,7 +766,20 @@ bot.command("launchcheck", async (ctx) => {
     `Slippage: <b>${config.DEFAULT_SLIPPAGE_PERCENT}%</b>`,
     `Priority fee: <b>${config.DEFAULT_PRIORITY_FEE_SOL} SOL</b>`,
     `Platform fee: <b>${config.PLATFORM_FEE_SOL} SOL</b>`,
-    `Treasury wallet: <b>${config.PLATFORM_FEE_SOL > 0 ? (config.PLATFORM_TREASURY_WALLET ? "SET" : "MISSING") : "off"}</b>`,
+    `Treasury wallet: <b>${
+      config.PLATFORM_FEE_SOL > 0 || customCaEnabled ? (config.PLATFORM_TREASURY_WALLET ? "SET" : "MISSING") : "off"
+    }</b>`,
+    `Custom CA: <b>${
+      customCaEnabled
+        ? [...customCaPricing.feesByLength.entries()]
+            .sort(([a], [b]) => a - b)
+            .map(([length, fee]) => `${length} chars ${fee} SOL`)
+            .join(", ")
+        : customCaPricing.feesByLength.size > 0
+          ? "off (GRINDER_API_TOKEN missing or under 24 characters)"
+          : "off"
+    }</b>`,
+    `Custom CA orders waiting for grinder: <b>${pendingCustomCaOrders.size}</b>`,
     `Robinhood platform fee: <b>${config.ROBINHOOD_PLATFORM_FEE_ETH} ETH</b>`,
     `Robinhood treasury wallet: <b>${
       config.ROBINHOOD_PLATFORM_FEE_ETH > 0 ? (config.ROBINHOOD_PLATFORM_TREASURY_WALLET ? "SET" : "MISSING") : "off"
@@ -1096,6 +1153,20 @@ bot.action(/^wizard:(.+)$/, async (ctx) => {
       return;
     }
 
+    if (action === "customca:start" || action === "customca:end") {
+      draft.customCaPosition = action === "customca:start" ? "start" : "end";
+      draft.forcedStep = "customCaText";
+      await ctx.answerCbQuery(`CA will ${draft.customCaPosition} with your text.`);
+      await advanceWizard(ctx, draft);
+      return;
+    }
+
+    if (action === "customca:none") {
+      await ctx.answerCbQuery("Normal CA.");
+      await advanceWizard(ctx, draft, true);
+      return;
+    }
+
     if (action === "group_tg") {
       const username = ctx.chat && "username" in ctx.chat ? ctx.chat.username : undefined;
       if (!username) {
@@ -1119,11 +1190,25 @@ bot.action(/^wizard:(.+)$/, async (ctx) => {
       if (!ctx.from) throw new Error("I could not identify the sender.");
       const proposal = await createProposal(idea, ctx.from.id, ctx.from.username);
       drafts.delete(key);
+      const customCa = customCaRequest(proposal);
+      if (customCa) {
+        await createCustomCaOrder(proposal.id, String(ctx.chat?.id ?? ctx.from.id));
+        pendingCustomCaOrders.set(proposal.id, { proposalId: proposal.id, ...customCa });
+        audit(ctx, "custom_ca_ordered", proposal.id, { ...customCa, feeSol: proposal.customCaFeeSol });
+      }
       await ctx.answerCbQuery("Submitted.");
       await ctx.editMessageText(proposalMessage(proposal, "Proposal Submitted"), {
         ...telegramReplyOptions,
         reply_markup: { inline_keyboard: proposalKeyboard(proposal) }
       });
+      if (customCa) {
+        await ctx.reply(
+          `&#9203; <b>Generating custom CA for #${proposal.id}</b>\nIt will ${escapeHtml(describeCustomCa(customCa))}. ` +
+            `Usually takes about ${formatSearchTime(expectedAttempts(customCa) / customCaPricing.keysPerSecond)}. ` +
+            "I'll post here when it's ready.",
+          telegramReplyOptions
+        );
+      }
       return;
     }
 
@@ -1225,7 +1310,10 @@ async function sendLaunchConfirmation(ctx: Context, mode: LaunchMode, id: number
   const devBuySol = proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL;
   const priorityFeeSol = priorityFeeForLaunchpad(proposal.launchpad);
   const platformFeeSol = config.PLATFORM_FEE_SOL > 0 ? config.PLATFORM_FEE_SOL : 0;
-  const minimumTotal = devBuySol + priorityFeeSol + platformFeeSol + config.LOCAL_LAUNCH_MIN_SOL_BUFFER;
+  const customFeeSol = customCaFeeSol(proposal);
+  const minimumTotal = devBuySol + priorityFeeSol + platformFeeSol + customFeeSol + config.LOCAL_LAUNCH_MIN_SOL_BUFFER;
+  const customCa = customCaRequest(proposal);
+  const customCaOrder = customCa ? await getCustomCaOrder(proposal.id) : undefined;
 
   await ctx.reply(
     [
@@ -1234,14 +1322,20 @@ async function sendLaunchConfirmation(ctx: Context, mode: LaunchMode, id: number
       `<b>${escapeHtml(proposal.name)}</b> | <code>$${escapeHtml(proposal.symbol)}</code>`,
       `Mode: <b>${mode === "api" ? "API" : mode === "group" ? "Group Wallet" : "Personal Wallet"}</b>`,
       `Launchpad: <b>${escapeHtml(proposal.launchpad)}</b>`,
+      customCa
+        ? `Custom CA: <b>${escapeHtml(describeCustomCa(customCa))}</b> (${customCaStatusLabel(customCaOrder)})`
+        : undefined,
       "",
       `Dev buy: <b>${devBuySol} SOL</b>`,
       `Priority fee: <b>${priorityFeeSol} SOL</b>`,
       platformFeeSol > 0 ? `Platform fee: <b>${platformFeeSol} SOL</b>` : `Platform fee: <b>off</b>`,
+      customCa ? `Custom CA fee: <b>${customFeeSol} SOL</b>` : undefined,
       `Required wallet minimum: <b>${minimumTotal.toFixed(6)} SOL</b>`,
       "",
       "Only continue if the metadata, image, wallet, and spend are correct."
-    ].join("\n"),
+    ]
+      .filter((line) => line !== undefined)
+      .join("\n"),
     {
       ...telegramReplyOptions,
       reply_markup: {
@@ -1322,7 +1416,7 @@ async function runGroupLaunch(ctx: Context, id: number): Promise<void> {
       throw error;
     }
     if (!result.dryRun && proposal.launchpad === "bonk" && exportedWallet) {
-      const platformFee: PlatformFeeResult = await sendPlatformFeeIfEnabled(exportedWallet.secretKey, wallet!.address).catch(
+      const platformFee: PlatformFeeResult = await sendPlatformFeeIfEnabled(exportedWallet.secretKey, wallet!.address, customCaFeeSol(proposal)).catch(
         (error): PlatformFeeResult => ({
           error: error instanceof Error ? error.message : String(error)
         })
@@ -1526,7 +1620,9 @@ async function runQueuedLaunch(
     return {
       launchpad: proposal.launchpad,
       dryRun: true,
-      message: `Dry run only. Would launch ${proposal.name} ($${proposal.symbol}) with ${mode} mode.`
+      message: `Dry run only. Would launch ${proposal.name} ($${proposal.symbol}) with ${mode} mode.${await customCaDryRunNote(
+        proposal
+      )}`
     };
   }
 
@@ -1552,7 +1648,7 @@ async function runQueuedLaunch(
         ? await launchWithPumpPortalApiKey(proposal, wallet!.apiKey)
         : await launchWithPumpFunSdk(proposal, exportedWallet?.secretKey ?? "", wallet!.address);
     if (!result.dryRun && proposal.launchpad === "bonk" && exportedWallet) {
-      const platformFee: PlatformFeeResult = await sendPlatformFeeIfEnabled(exportedWallet.secretKey, wallet!.address).catch(
+      const platformFee: PlatformFeeResult = await sendPlatformFeeIfEnabled(exportedWallet.secretKey, wallet!.address, customCaFeeSol(proposal)).catch(
         (error): PlatformFeeResult => ({
           error: error instanceof Error ? error.message : String(error)
         })
@@ -1600,10 +1696,9 @@ async function assertGroupLaunchReady(proposal: Proposal, groupId: string, walle
     return;
   }
 
-  const suffix = mintSuffixForLaunchpad(proposal.launchpad);
   const devBuySol = proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL;
   const priorityFeeSol = priorityFeeForLaunchpad(proposal.launchpad);
-  const platformFeeSol = config.PLATFORM_FEE_SOL > 0 ? config.PLATFORM_FEE_SOL : 0;
+  const platformFeeSol = platformFeeForProposal(proposal);
   const requiredSol = devBuySol + priorityFeeSol + platformFeeSol + config.LOCAL_LAUNCH_MIN_SOL_BUFFER;
 
   if (config.MAX_DEV_BUY_SOL > 0 && devBuySol > config.MAX_DEV_BUY_SOL) {
@@ -1623,9 +1718,8 @@ async function assertGroupLaunchReady(proposal: Proposal, groupId: string, walle
     problems.push("Bags vanity suffix is not supported by the current Bags SDK launch flow; set BAGS_MINT_SUFFIX=");
   }
   if (proposal.launchpad === "pumpfun" && !config.PINATA_JWT) problems.push("PINATA_JWT is missing");
-  if (suffix && (await countAvailableVanityMints(suffix)) < 1) {
-    problems.push(`no ${proposal.launchpad} vanity mints available for suffix "${suffix}"`);
-  }
+  const mintProblem = await mintReadinessProblem(proposal);
+  if (mintProblem) problems.push(mintProblem);
 
   if (proposal.launchpad === "bonk") {
     try {
@@ -1678,10 +1772,9 @@ async function assertPersonalLaunchReady(proposal: Proposal, walletAddress: stri
     return;
   }
 
-  const suffix = mintSuffixForLaunchpad(proposal.launchpad);
   const devBuySol = proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL;
   const priorityFeeSol = priorityFeeForLaunchpad(proposal.launchpad);
-  const platformFeeSol = config.PLATFORM_FEE_SOL > 0 ? config.PLATFORM_FEE_SOL : 0;
+  const platformFeeSol = platformFeeForProposal(proposal);
   const requiredSol = devBuySol + priorityFeeSol + platformFeeSol + config.LOCAL_LAUNCH_MIN_SOL_BUFFER;
 
   if (config.MAX_DEV_BUY_SOL > 0 && devBuySol > config.MAX_DEV_BUY_SOL) {
@@ -1699,9 +1792,8 @@ async function assertPersonalLaunchReady(proposal: Proposal, walletAddress: stri
     problems.push("PLATFORM_TREASURY_WALLET is not a valid Solana wallet address");
   }
   if (!config.PINATA_JWT) problems.push("PINATA_JWT is missing");
-  if (suffix && (await countAvailableVanityMints(suffix)) < 1) {
-    problems.push(`no ${proposal.launchpad} vanity mints available for suffix "${suffix}"`);
-  }
+  const mintProblem = await mintReadinessProblem(proposal);
+  if (mintProblem) problems.push(mintProblem);
 
   try {
     const balance = await getSolBalance(walletAddress);
@@ -1799,8 +1891,8 @@ async function assertRobinhoodLaunchReady(proposal: Proposal, walletAddress: str
 
 async function assertApiLaunchReady(proposal: Proposal): Promise<void> {
   const problems: string[] = [];
-  const suffix = mintSuffixForLaunchpad(proposal.launchpad);
   const devBuySol = proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL;
+  const platformFeeSol = platformFeeForProposal(proposal);
 
   if (config.MAX_DEV_BUY_SOL > 0 && devBuySol > config.MAX_DEV_BUY_SOL) {
     problems.push(`dev buy ${devBuySol} SOL exceeds MAX_DEV_BUY_SOL ${config.MAX_DEV_BUY_SOL} SOL`);
@@ -1812,18 +1904,17 @@ async function assertApiLaunchReady(proposal: Proposal): Promise<void> {
     problems.push("PUMPFUN_SIGNER_PRIVATE_KEY is missing");
   }
   if (proposal.launchpad === "bonk" && !config.PUMPPORTAL_API_KEY) problems.push("PUMPPORTAL_API_KEY is missing");
-  if (proposal.launchpad === "bonk" && config.PLATFORM_FEE_SOL > 0) {
-    problems.push("per-launch platform fee requires group-wallet launch for Bonk");
+  if (proposal.launchpad === "bonk" && platformFeeSol > 0) {
+    problems.push("per-launch platform and custom CA fees require group-wallet launch for Bonk");
   }
-  if (config.PLATFORM_FEE_SOL > 0 && !config.PLATFORM_TREASURY_WALLET) problems.push("PLATFORM_TREASURY_WALLET is missing");
-  if (config.PLATFORM_FEE_SOL > 0 && config.PLATFORM_TREASURY_WALLET && !isValidSolanaAddress(config.PLATFORM_TREASURY_WALLET)) {
+  if (platformFeeSol > 0 && !config.PLATFORM_TREASURY_WALLET) problems.push("PLATFORM_TREASURY_WALLET is missing");
+  if (platformFeeSol > 0 && config.PLATFORM_TREASURY_WALLET && !isValidSolanaAddress(config.PLATFORM_TREASURY_WALLET)) {
     problems.push("PLATFORM_TREASURY_WALLET is not a valid Solana wallet address");
   }
   if (proposal.launchpad === "pumpfun" && !config.PINATA_JWT) problems.push("PINATA_JWT is missing");
   if (!proposal.image) problems.push("proposal has no image");
-  if (suffix && (await countAvailableVanityMints(suffix)) < 1) {
-    problems.push(`no ${proposal.launchpad} vanity mints available for suffix "${suffix}"`);
-  }
+  const mintProblem = await mintReadinessProblem(proposal);
+  if (mintProblem) problems.push(mintProblem);
 
   if (proposal.image) {
     try {
@@ -1855,6 +1946,84 @@ function mintSuffixForLaunchpad(launchpad: Launchpad): string {
 function priorityFeeForLaunchpad(launchpad: Launchpad): number {
   if (launchpad === "bonk") return Math.max(config.DEFAULT_PRIORITY_FEE_SOL, 0.0005);
   return config.DEFAULT_PRIORITY_FEE_SOL;
+}
+
+/** Everything sent to the treasury after a successful launch: the platform fee plus any custom CA fee. */
+function platformFeeForProposal(proposal: Proposal): number {
+  return (config.PLATFORM_FEE_SOL > 0 ? config.PLATFORM_FEE_SOL : 0) + customCaFeeSol(proposal);
+}
+
+async function mintReadinessProblem(proposal: Proposal): Promise<string | undefined> {
+  const customCa = customCaRequest(proposal);
+  if (customCa) {
+    const order = await getCustomCaOrder(proposal.id);
+    // A reservation left by a crashed launch is reclaimed at launch time, so let the launch decide.
+    if (order?.status === "ready" || order?.status === "reserved") return undefined;
+    return `custom CA (${describeCustomCa(customCa)}) is ${customCaStatusLabel(order)}`;
+  }
+
+  const suffix = mintSuffixForLaunchpad(proposal.launchpad);
+  if (suffix && (await countAvailableVanityMints(suffix)) < 1) {
+    return `no ${proposal.launchpad} vanity mints available for suffix "${suffix}"`;
+  }
+  return undefined;
+}
+
+function customCaRequest(proposal: Proposal): CustomCaRequest | undefined {
+  if (!proposal.customCaPattern) return undefined;
+  return { position: proposal.customCaPosition ?? "end", pattern: proposal.customCaPattern };
+}
+
+function customCaStatusLabel(order: CustomCaOrder | undefined): string {
+  if (!order) return "not ordered";
+  if (order.status === "pending") return "still being generated";
+  if (order.status === "reserved") return "in use by a launch";
+  if (order.status === "used") return "already used";
+  return order.status;
+}
+
+async function customCaDryRunNote(proposal: Proposal): Promise<string> {
+  const customCa = customCaRequest(proposal);
+  if (!customCa) return "";
+  const order = await getCustomCaOrder(proposal.id);
+  return ` Custom CA (${describeCustomCa(customCa)}): ${customCaStatusLabel(order)}.`;
+}
+
+async function cancelCustomCaIfRejected(proposal: Proposal): Promise<void> {
+  if (proposal.status !== "rejected" || !proposal.customCaPattern) return;
+  pendingCustomCaOrders.delete(proposal.id);
+  await cancelCustomCaOrder(proposal.id);
+}
+
+/** Called by the grinder API with a keypair it found. Verifies it before storing it encrypted. */
+async function storeCustomCaResult(proposalId: number, address: string, secretKeyBase58: string): Promise<GrinderSubmitResult> {
+  const order = pendingCustomCaOrders.get(proposalId);
+  if (!order) return { ok: false, status: 404, error: `no pending custom CA order for #${proposalId}` };
+
+  const problem = customCaKeypairProblem(order, address, secretKeyBase58);
+  if (problem) return { ok: false, status: 400, error: problem };
+
+  const stored = await fulfillCustomCaOrder(proposalId, address, encryptMintSecret(secretKeyBase58));
+  pendingCustomCaOrders.delete(proposalId);
+  if (!stored) return { ok: false, status: 409, error: `custom CA order for #${proposalId} is no longer pending` };
+
+  logInfo("custom_ca_ready", { proposalId, position: order.position, pattern: order.pattern });
+  await bot.telegram
+    .sendMessage(
+      stored.chatId,
+      `&#9989; <b>Custom CA ready for #${proposalId}</b>\nIt will ${escapeHtml(describeCustomCa(order))}. ` +
+        "The full address stays hidden until launch.",
+      telegramReplyOptions
+    )
+    .catch((error) => logError("custom_ca_ready_notify_failed", error, { proposalId }));
+  return { ok: true };
+}
+
+/** Adds orders from the database that this process does not know about yet. */
+async function loadPendingCustomCaOrders(): Promise<void> {
+  for (const order of await listPendingCustomCaOrders()) {
+    if (!pendingCustomCaOrders.has(order.proposalId)) pendingCustomCaOrders.set(order.proposalId, order);
+  }
 }
 
 function dayAgoIso(): string {
@@ -2119,6 +2288,12 @@ async function applyWizardText(ctx: Context, draft: Draft, value: string): Promi
   } else if (draft.step === "feeSharePercent") {
     const percent = Number(value.replace("%", ""));
     draft.data.pumpfunFeeShares = feeSplitFromPercent(draft.customFeeWallet, percent);
+  } else if (draft.step === "customCaText") {
+    const position = draft.customCaPosition ?? "end";
+    const quote = quoteCustomCa({ position, pattern: normalizeCustomCaPattern(position, value) }, customCaPricing);
+    draft.data.customCaPosition = quote.position;
+    draft.data.customCaPattern = quote.pattern;
+    draft.data.customCaFeeSol = quote.feeSol;
   }
 
   await advanceWizard(ctx, draft);
@@ -2143,7 +2318,7 @@ async function advanceWizard(ctx: Context, draft: Draft, edit = false): Promise<
     return;
   }
 
-  const question = wizardQuestion(draft.step);
+  const question = wizardQuestion(draft.step, draft);
   if (!edit) await safeDeleteMessage(ctx, previousPromptMessageId, "previous wizard prompt");
   draft.promptMessageId = await sendWizardMessage(ctx, question.text, question.keyboard, question.forceReply, edit);
 }
@@ -2164,15 +2339,21 @@ function nextDraftStep(draft: Draft): DraftStep {
   if (draft.step === "telegram") return "twitter";
   if (draft.step === "twitter") return "image";
   if (draft.step === "image") return "devBuy";
-  if (draft.step === "devBuy") return draft.data.launchpad === "pumpfun" ? "cashback" : "preview";
+  if (draft.step === "devBuy") return draft.data.launchpad === "pumpfun" ? "cashback" : customCaStepOrPreview(draft);
   if (draft.step === "cashback") return "feeShares";
-  if (draft.step === "feeShares") return "preview";
+  if (draft.step === "feeShares") return customCaStepOrPreview(draft);
   if (draft.step === "feeShareWallet") return "feeSharePercent";
-  if (draft.step === "feeSharePercent") return "preview";
+  if (draft.step === "feeSharePercent") return customCaStepOrPreview(draft);
+  if (draft.step === "customCa" || draft.step === "customCaText") return "preview";
   return draft.step;
 }
 
-function wizardQuestion(step: DraftStep): {
+function customCaStepOrPreview(draft: Draft): DraftStep {
+  const supported = draft.data.launchpad === "pumpfun" || draft.data.launchpad === "bonk";
+  return customCaEnabled && supported ? "customCa" : "preview";
+}
+
+function wizardQuestion(step: DraftStep, draft?: Draft): {
   text: string;
   keyboard?: InlineKeyboardButton[][];
   forceReply?: boolean;
@@ -2212,7 +2393,21 @@ function wizardQuestion(step: DraftStep): {
     feeShares:
       "Choose Pump.fun creator-fee sharing. This can lock reward distribution once configured.",
     feeShareWallet: "Send the wallet that should receive part of the creator fees.",
-    feeSharePercent: "Choose what percent this wallet should receive. The remaining percent goes to the creator/dev wallet."
+    feeSharePercent: "Choose what percent this wallet should receive. The remaining percent goes to the creator/dev wallet.",
+    customCa: [
+      "Want a custom contract address? Pick whether the CA should start or end with your text, or keep a normal CA for free.",
+      "",
+      ...[...customCaPricing.feesByLength.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([length, fee]) => `${length} characters: <b>${fee} SOL</b>`),
+      "",
+      "The fee is paid from the launch wallet only after a successful launch."
+    ].join("\n"),
+    customCaText: [
+      `Reply with the text the CA should ${draft?.customCaPosition === "start" ? "start" : "end"} with.`,
+      "Letters and numbers only, except 0, O, I and l. Upper and lower case must match exactly.",
+      "Send <code>/skip</code> to keep a normal CA instead."
+    ].join("\n")
   };
 
   const skipButton = (field: string): InlineKeyboardButton => ({
@@ -2263,6 +2458,14 @@ function wizardQuestion(step: DraftStep): {
         { text: "Custom", callback_data: "wizard:fees_percent_custom" }
       ],
       [{ text: "❌ Cancel", callback_data: "wizard:cancel" }]
+    ],
+    customCa: [
+      [
+        { text: "Starts with…", callback_data: "wizard:customca:start" },
+        { text: "Ends with…", callback_data: "wizard:customca:end" }
+      ],
+      [{ text: "Normal CA (free)", callback_data: "wizard:customca:none" }],
+      [{ text: "❌ Cancel", callback_data: "wizard:cancel" }]
     ]
   };
 
@@ -2275,7 +2478,8 @@ function wizardQuestion(step: DraftStep): {
       step === "description" ||
       step === "feeShares" ||
       step === "feeShareWallet" ||
-      step === "feeSharePercent"
+      step === "feeSharePercent" ||
+      step === "customCaText"
   };
 }
 
@@ -2359,6 +2563,7 @@ async function applyRejectionText(
     await ctx.reply(`Proposal #${draft.proposalId} not found or cannot be rejected.`);
     return;
   }
+  await cancelCustomCaIfRejected(proposal);
   audit(ctx, "proposal_rejected", proposal.id, { reason });
 
   await ctx.reply(
@@ -2510,7 +2715,14 @@ async function safeEditMessageText(ctx: Context, text: string, keyboard: InlineK
 }
 
 function canSkipStep(step: DraftStep): boolean {
-  return step === "website" || step === "telegram" || step === "twitter" || step === "devBuy";
+  return (
+    step === "website" ||
+    step === "telegram" ||
+    step === "twitter" ||
+    step === "devBuy" ||
+    step === "customCa" ||
+    step === "customCaText"
+  );
 }
 
 async function isBotAdmin(ctx: Context): Promise<boolean> {
@@ -2584,17 +2796,26 @@ function isRateLimited(chatId: string, fromId: string): boolean {
 function startHealthServer(): void {
   if (!config.HEALTHCHECK_PORT) return;
 
-  const server = http.createServer((_, response) => {
-    response.writeHead(databaseHealthy ? 200 : 503, { "content-type": "application/json" });
-    response.end(
-      JSON.stringify({
-        ok: databaseHealthy,
-        database: databaseHealthy ? "connected" : "starting",
-        mode: config.DRY_RUN ? "dry-run" : "live",
-        uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
-        activeLaunches: activeLaunches.size
+  const server = http.createServer((request, response) => {
+    void handleGrinderRequest(request, response, grinderApi)
+      .then((handled) => {
+        if (handled) return;
+        response.writeHead(databaseHealthy ? 200 : 503, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({
+            ok: databaseHealthy,
+            database: databaseHealthy ? "connected" : "starting",
+            mode: config.DRY_RUN ? "dry-run" : "live",
+            uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
+            activeLaunches: activeLaunches.size
+          })
+        );
       })
-    );
+      .catch((error) => {
+        logError("grinder_api_failed", error);
+        if (!response.headersSent) response.writeHead(500, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "internal error" }));
+      });
   });
 
   server.listen(config.HEALTHCHECK_PORT, () => {
@@ -2619,6 +2840,12 @@ async function startBot(): Promise<void> {
   logInfo("database_connected", { provider: "postgres" });
   // Resume jobs queued before a restart; the worker schedules its own wakeups from here.
   void launchJobWorker.run();
+  await loadPendingCustomCaOrders();
+  // Pick up orders the outgoing instance took while a deploy overlapped this one.
+  setTimeout(
+    () => void loadPendingCustomCaOrders().catch((error) => logError("custom_ca_orders_load_failed", error)),
+    3 * 60_000
+  ).unref();
   await launchBotWithRetry();
 }
 

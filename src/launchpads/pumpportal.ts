@@ -11,10 +11,19 @@ import BN from "bn.js";
 import bs58 from "bs58";
 import nacl from "tweetnacl";
 import { config } from "../config.js";
-import { consumeVanityMint, markVanityMintUsed, releaseVanityMint } from "../db.js";
+import { customCaFeeSol, customCaKeypairProblem, describeCustomCa } from "../customCa.js";
+import {
+  consumeVanityMint,
+  getCustomCaOrder,
+  markCustomCaOrderUsed,
+  markVanityMintUsed,
+  releaseCustomCaOrder,
+  releaseVanityMint,
+  reserveCustomCaOrder
+} from "../db.js";
 import { imageValidationSummary, validateImageFile } from "../imageValidation.js";
 import type { LaunchResult, Proposal } from "../types.js";
-import { getSolBalance } from "../wallets.js";
+import { decryptMintSecret, getSolBalance } from "../wallets.js";
 
 type PumpSdkPackage = {
   getBuyTokenAmountFromSolAmount: (args: {
@@ -47,8 +56,9 @@ interface MintKeypair {
   publicKey?: Uint8Array;
   secretKeyBase58: string;
   address: string;
-  source: "random" | "pool";
+  source: "random" | "pool" | "custom";
   poolId?: number;
+  customProposalId?: number;
 }
 
 interface FeeSharingResult {
@@ -107,7 +117,7 @@ export async function launchWithPumpPortalApiKey(proposal: Proposal, pumpPortalA
 
     console.log(`[launch:${proposal.id}] metadata ready: ${metadataUri}`);
     const signature = await sendCreateWithRetries(proposal, mintKeypair, metadataUri, pumpPortalApiKey);
-    if (mintKeypair.poolId) await markVanityMintUsed(mintKeypair.poolId);
+    await markMintUsed(mintKeypair);
 
     return {
       launchpad: proposal.launchpad,
@@ -119,10 +129,8 @@ export async function launchWithPumpPortalApiKey(proposal: Proposal, pumpPortalA
       message: `Launched ${proposal.name} ($${proposal.symbol}).`
     };
   } catch (error) {
-    if (mintKeypair.poolId) {
-      if (error instanceof UnknownConfirmationError) await markVanityMintUsed(mintKeypair.poolId);
-      else await releaseVanityMint(mintKeypair.poolId);
-    }
+    if (error instanceof UnknownConfirmationError) await markMintUsed(mintKeypair);
+    else await releaseMint(mintKeypair);
     throw error;
   }
 }
@@ -147,7 +155,8 @@ export async function launchWithPumpFunSdk(
   await assertLocalWalletFunded(
     signerKeypair.publicKey.toBase58(),
     proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL,
-    priorityFeeForLaunchpad(proposal.launchpad)
+    priorityFeeForLaunchpad(proposal.launchpad),
+    customCaFeeSol(proposal)
   );
   validatePumpFunFeeShares(proposal, signerKeypair.publicKey);
 
@@ -165,9 +174,10 @@ export async function launchWithPumpFunSdk(
     );
     const platformFee: PlatformFeeResult = await sendPlatformFeeIfEnabled(
       signerSecretKeyBase58,
-      signerKeypair.publicKey.toBase58()
+      signerKeypair.publicKey.toBase58(),
+      customCaFeeSol(proposal)
     ).catch((error): PlatformFeeResult => ({ error: errorMessage(error) }));
-    if (mintKeypair.poolId) await markVanityMintUsed(mintKeypair.poolId);
+    await markMintUsed(mintKeypair);
 
     return {
       launchpad: proposal.launchpad,
@@ -185,10 +195,8 @@ export async function launchWithPumpFunSdk(
       message: `Launched ${proposal.name} ($${proposal.symbol}).`
     };
   } catch (error) {
-    if (mintKeypair.poolId) {
-      if (error instanceof UnknownConfirmationError) await markVanityMintUsed(mintKeypair.poolId);
-      else await releaseVanityMint(mintKeypair.poolId);
-    }
+    if (error instanceof UnknownConfirmationError) await markMintUsed(mintKeypair);
+    else await releaseMint(mintKeypair);
     throw error;
   }
 }
@@ -210,7 +218,7 @@ async function launchBonkWithFreshMints(proposal: Proposal, pumpPortalApiKey: st
       submitted = true;
       console.log(`[launch:${proposal.id}] launch signature: ${signature}`);
       await waitForBonkLanding(signature, proposal.id, mintKeypair.address);
-      if (mintKeypair.poolId) await markVanityMintUsed(mintKeypair.poolId);
+      await markMintUsed(mintKeypair);
 
       return {
         launchpad: proposal.launchpad,
@@ -222,12 +230,10 @@ async function launchBonkWithFreshMints(proposal: Proposal, pumpPortalApiKey: st
         message: `Launched ${proposal.name} ($${proposal.symbol}).`
       };
     } catch (error) {
-      if (mintKeypair.poolId) {
-        if (submitted || error instanceof UnlandedLaunchError || error instanceof UnknownConfirmationError) {
-          await markVanityMintUsed(mintKeypair.poolId);
-        } else {
-          await releaseVanityMint(mintKeypair.poolId);
-        }
+      if (submitted || error instanceof UnlandedLaunchError || error instanceof UnknownConfirmationError) {
+        await markMintUsed(mintKeypair);
+      } else {
+        await releaseMint(mintKeypair);
       }
 
       if (error instanceof NonRetryableLaunchError) throw error;
@@ -260,7 +266,8 @@ export async function launchWithPumpPortalLocal(
   await assertLocalWalletFunded(
     signerAddress,
     proposal.devBuySol ?? config.DEFAULT_DEV_BUY_SOL,
-    priorityFeeForLaunchpad(proposal.launchpad)
+    priorityFeeForLaunchpad(proposal.launchpad),
+    customCaFeeSol(proposal)
   );
 
   const mintKeypair = await getMintKeypair(proposal);
@@ -274,9 +281,10 @@ export async function launchWithPumpPortalLocal(
     const signature = await sendLocalCreateWithRetries(proposal, signerKeypair, mintSigner, mintKeypair, metadataUri);
     const platformFee: PlatformFeeResult = await sendPlatformFeeIfEnabled(
       signerSecretKeyBase58,
-      signerKeypair.publicKey.toBase58()
+      signerKeypair.publicKey.toBase58(),
+      customCaFeeSol(proposal)
     ).catch((error): PlatformFeeResult => ({ error: errorMessage(error) }));
-    if (mintKeypair.poolId) await markVanityMintUsed(mintKeypair.poolId);
+    await markMintUsed(mintKeypair);
 
     return {
       launchpad: proposal.launchpad,
@@ -291,18 +299,21 @@ export async function launchWithPumpPortalLocal(
       message: `Launched ${proposal.name} ($${proposal.symbol}).`
     };
   } catch (error) {
-    if (mintKeypair.poolId) {
-      if (error instanceof UnknownConfirmationError) await markVanityMintUsed(mintKeypair.poolId);
-      else await releaseVanityMint(mintKeypair.poolId);
-    }
+    if (error instanceof UnknownConfirmationError) await markMintUsed(mintKeypair);
+    else await releaseMint(mintKeypair);
     throw error;
   }
 }
 
-async function assertLocalWalletFunded(address: string, devBuySol: number, priorityFeeSol: number): Promise<void> {
-  validatePlatformFeeConfig();
+async function assertLocalWalletFunded(
+  address: string,
+  devBuySol: number,
+  priorityFeeSol: number,
+  extraFeeSol = 0
+): Promise<void> {
+  validatePlatformFeeConfig(extraFeeSol);
   const balance = await getSolBalance(address);
-  const platformFeeSol = configuredPlatformFeeSol();
+  const platformFeeSol = configuredPlatformFeeSol() + extraFeeSol;
   const required = devBuySol + priorityFeeSol + platformFeeSol + config.LOCAL_LAUNCH_MIN_SOL_BUFFER;
   if (balance < required) {
     throw new NonRetryableLaunchError(
@@ -313,11 +324,13 @@ async function assertLocalWalletFunded(address: string, devBuySol: number, prior
   }
 }
 
+/** Sends the platform fee plus any extra fee (such as a custom CA fee) to the treasury in one transfer. */
 export async function sendPlatformFeeIfEnabled(
   signerSecretKeyBase58: string,
-  signerAddress?: string
+  signerAddress?: string,
+  extraFeeSol = 0
 ): Promise<PlatformFeeResult> {
-  const platformFeeSol = configuredPlatformFeeSol();
+  const platformFeeSol = configuredPlatformFeeSol() + Math.max(0, extraFeeSol);
   if (platformFeeSol <= 0) return {};
 
   const treasury = platformTreasuryPublicKey();
@@ -366,8 +379,8 @@ function configuredPlatformFeeSol(): number {
   return config.PLATFORM_FEE_SOL > 0 ? config.PLATFORM_FEE_SOL : 0;
 }
 
-function validatePlatformFeeConfig(): void {
-  if (configuredPlatformFeeSol() <= 0) return;
+function validatePlatformFeeConfig(extraFeeSol = 0): void {
+  if (configuredPlatformFeeSol() + extraFeeSol <= 0) return;
   platformTreasuryPublicKey();
 }
 
@@ -1046,6 +1059,8 @@ export async function probePumpPortalLocalCreate(
 }
 
 async function getMintKeypair(proposal: Proposal): Promise<MintKeypair> {
+  if (proposal.customCaPattern) return reserveCustomMint(proposal);
+
   const suffix = mintSuffixForLaunchpad(proposal).trim();
   if (suffix) {
     const mint = await consumeVanityMint(suffix, proposal.id);
@@ -1075,6 +1090,42 @@ async function getMintKeypair(proposal: Proposal): Promise<MintKeypair> {
     address: bs58.encode(keypair.publicKey),
     source: "random"
   };
+}
+
+async function reserveCustomMint(proposal: Proposal): Promise<MintKeypair> {
+  const request = { position: proposal.customCaPosition ?? "end", pattern: proposal.customCaPattern ?? "" };
+  const order = await reserveCustomCaOrder(proposal.id);
+  if (!order?.address || !order.encryptedSecretKey) {
+    const current = await getCustomCaOrder(proposal.id);
+    const reason =
+      current?.status === "used"
+        ? "was already used by an earlier launch attempt"
+        : current?.status === "cancelled"
+          ? "was cancelled"
+          : current?.status === "reserved"
+            ? "is being used by another launch right now"
+            : "is still being generated. Keep the grinder running and launch again once the bot says it is ready";
+    throw new NonRetryableLaunchError(`Custom CA for #${proposal.id} (${describeCustomCa(request)}) ${reason}.`);
+  }
+
+  const secretKeyBase58 = decryptMintSecret(order.encryptedSecretKey);
+  const problem = customCaKeypairProblem(request, order.address, secretKeyBase58);
+  if (problem) {
+    await releaseCustomCaOrder(proposal.id);
+    throw new NonRetryableLaunchError(`Stored custom CA for #${proposal.id} is invalid: ${problem}.`);
+  }
+
+  return { secretKeyBase58, address: order.address, source: "custom", customProposalId: proposal.id };
+}
+
+async function markMintUsed(mint: MintKeypair): Promise<void> {
+  if (mint.poolId) await markVanityMintUsed(mint.poolId);
+  if (mint.customProposalId) await markCustomCaOrderUsed(mint.customProposalId);
+}
+
+async function releaseMint(mint: MintKeypair): Promise<void> {
+  if (mint.poolId) await releaseVanityMint(mint.poolId);
+  if (mint.customProposalId) await releaseCustomCaOrder(mint.customProposalId);
 }
 
 function mintSuffixForLaunchpad(proposal: Proposal): string {

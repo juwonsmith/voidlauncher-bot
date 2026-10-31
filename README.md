@@ -183,6 +183,22 @@ This starter keeps `DRY_RUN=true` by default. Before real launches, you should a
 - Keep launch amounts small until the whole flow is audited.
 - Keep admins limited to trusted Telegram user IDs.
 
+## Paid Custom CAs
+
+People can pay to launch a Pump.fun or Bonk token whose CA starts or ends with text they choose. After the dev buy step, `/idea` offers **Starts with…**, **Ends with…** or **Normal CA (free)**, quotes the fee, and refuses text that would take longer than `CUSTOM_CA_MAX_WAIT_MINUTES` to find.
+
+The search runs on your own machine, not on Render:
+
+1. Set `CUSTOM_CA_FEES_SOL` (for example `3:0.05,4:0.1`), `GRINDER_API_TOKEN` (24+ random characters) and `PLATFORM_TREASURY_WALLET` on Render.
+2. On the grinder PC, put the same `GRINDER_API_TOKEN` and `CUSTOM_CA_BOT_URL=https://<your-service>.onrender.com` in `.env`.
+3. Run `npm run vanity:custom` and leave it running.
+
+The grinder asks the bot for orders every 15 seconds over HTTPS. The bot answers from memory, so the database can still sleep. When an address is found, the bot checks it, encrypts its key with `WALLET_ENCRYPTION_KEY`, and posts "Custom CA ready" in the group. The address itself stays hidden until launch. The fee is sent to the treasury with the platform fee only after a successful launch. Rejecting a proposal cancels its order.
+
+Each extra character makes the search about 58 times longer. On a 4-core PC (about 40,000 keys a second), 3 characters take seconds, 4 take about 4 minutes, and 5 take about 4 hours. Set `CUSTOM_CA_KEYS_PER_SECOND` to your machine's speed; the grinder prints its attempts every 5 seconds. Bags and Robinhood Chain choose their own addresses, so they can't offer custom CAs.
+
+If Node can't reach the bot from a PC with antivirus TLS scanning, set `NODE_EXTRA_CA_CERTS` to the antivirus root certificate.
+
 ## Pump.fun CA Suffix
 
 Pump.fun token addresses that end in `pump` are vanity mint addresses. They are not automatic when a normal random mint keypair is generated.

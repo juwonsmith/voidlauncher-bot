@@ -88,6 +88,22 @@ export interface LaunchJob {
   completedAt?: string;
 }
 
+export interface CustomCaOrder {
+  proposalId: number;
+  chatId: string;
+  status: "pending" | "ready" | "reserved" | "used" | "cancelled";
+  address?: string;
+  encryptedSecretKey?: string;
+  createdAt: string;
+  readyAt?: string;
+}
+
+export interface PendingCustomCaOrder {
+  proposalId: number;
+  position: "start" | "end";
+  pattern: string;
+}
+
 export interface LaunchJobInput {
   proposalId: number;
   launchpad: string;
@@ -207,6 +223,25 @@ async function initializeDatabase(): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_launch_jobs_proposal ON launch_jobs(proposal_id, created_at);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_launch_jobs_active_proposal_mode
       ON launch_jobs(proposal_id, mode) WHERE status IN ('queued', 'running');
+
+    ALTER TABLE proposals
+      ADD COLUMN IF NOT EXISTS custom_ca_position TEXT,
+      ADD COLUMN IF NOT EXISTS custom_ca_pattern TEXT,
+      ADD COLUMN IF NOT EXISTS custom_ca_fee_sol DOUBLE PRECISION;
+
+    CREATE TABLE IF NOT EXISTS custom_ca_orders (
+      proposal_id BIGINT PRIMARY KEY REFERENCES proposals(id),
+      chat_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      address TEXT UNIQUE,
+      encrypted_secret_key TEXT,
+      created_at TIMESTAMPTZ NOT NULL,
+      ready_at TIMESTAMPTZ,
+      reserved_at TIMESTAMPTZ,
+      used_at TIMESTAMPTZ
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_custom_ca_orders_status ON custom_ca_orders(status, proposal_id);
   `);
 }
 
@@ -289,7 +324,11 @@ function mapProposal(row: QueryResultRow): Proposal {
     approvedBy: row.approved_by === null || row.approved_by === undefined ? undefined : Number(row.approved_by),
     approvedAt: row.approved_at ? asIso(row.approved_at) : undefined,
     rejectionReason: row.rejection_reason ? String(row.rejection_reason) : undefined,
-    launchSignature: row.launch_signature ? String(row.launch_signature) : undefined
+    launchSignature: row.launch_signature ? String(row.launch_signature) : undefined,
+    customCaPosition: row.custom_ca_position ? (String(row.custom_ca_position) as Proposal["customCaPosition"]) : undefined,
+    customCaPattern: row.custom_ca_pattern ? String(row.custom_ca_pattern) : undefined,
+    customCaFeeSol:
+      row.custom_ca_fee_sol === null || row.custom_ca_fee_sol === undefined ? undefined : Number(row.custom_ca_fee_sol)
   };
 }
 
@@ -302,8 +341,9 @@ export async function createProposal(
   const result = await pool.query(
     `INSERT INTO proposals (
       launchpad, name, symbol, description, website, telegram, twitter, image,
-      dev_buy_sol, dev_buy_eth, pumpfun_cashback, pumpfun_fee_shares, created_by, created_by_username, created_at
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+      dev_buy_sol, dev_buy_eth, pumpfun_cashback, pumpfun_fee_shares, created_by, created_by_username, created_at,
+      custom_ca_position, custom_ca_pattern, custom_ca_fee_sol
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), $15, $16, $17)
     RETURNING *`,
     [
       idea.launchpad,
@@ -319,7 +359,10 @@ export async function createProposal(
       idea.pumpfunCashback ?? null,
       idea.pumpfunFeeShares ?? null,
       createdBy,
-      createdByUsername ?? null
+      createdByUsername ?? null,
+      idea.customCaPattern ? idea.customCaPosition ?? null : null,
+      idea.customCaPattern ?? null,
+      idea.customCaPattern ? idea.customCaFeeSol ?? null : null
     ]
   );
   return mapProposal(result.rows[0]);
@@ -371,6 +414,98 @@ export async function rejectProposal(id: number, reason: string): Promise<Propos
     [reason, id]
   );
   return result.rows[0] ? mapProposal(result.rows[0]) : getProposal(id);
+}
+
+export async function createCustomCaOrder(proposalId: number, chatId: string): Promise<void> {
+  await databaseReady;
+  await pool.query(
+    `INSERT INTO custom_ca_orders (proposal_id, chat_id, status, created_at)
+     VALUES ($1, $2, 'pending', NOW()) ON CONFLICT (proposal_id) DO NOTHING`,
+    [proposalId, chatId]
+  );
+}
+
+export async function listPendingCustomCaOrders(): Promise<PendingCustomCaOrder[]> {
+  await databaseReady;
+  const result = await pool.query(
+    `SELECT o.proposal_id, p.custom_ca_position, p.custom_ca_pattern
+     FROM custom_ca_orders o JOIN proposals p ON p.id = o.proposal_id
+     WHERE o.status = 'pending' AND p.custom_ca_pattern IS NOT NULL
+     ORDER BY o.proposal_id ASC`
+  );
+  return result.rows.map((row) => ({
+    proposalId: Number(row.proposal_id),
+    position: String(row.custom_ca_position) === "start" ? "start" : "end",
+    pattern: String(row.custom_ca_pattern)
+  }));
+}
+
+export async function getCustomCaOrder(proposalId: number): Promise<CustomCaOrder | undefined> {
+  await databaseReady;
+  const result = await pool.query("SELECT * FROM custom_ca_orders WHERE proposal_id = $1", [proposalId]);
+  return result.rows[0] ? mapCustomCaOrder(result.rows[0]) : undefined;
+}
+
+/** Stores a found keypair. Returns the order, or undefined when it was no longer pending. */
+export async function fulfillCustomCaOrder(
+  proposalId: number,
+  address: string,
+  encryptedSecretKey: string
+): Promise<CustomCaOrder | undefined> {
+  await databaseReady;
+  const result = await pool.query(
+    `UPDATE custom_ca_orders
+     SET status = 'ready', address = $2, encrypted_secret_key = $3, ready_at = NOW()
+     WHERE proposal_id = $1 AND status = 'pending' RETURNING *`,
+    [proposalId, address, encryptedSecretKey]
+  );
+  return result.rows[0] ? mapCustomCaOrder(result.rows[0]) : undefined;
+}
+
+/** Claims a ready custom mint for a launch. A reservation from a crashed launch is reclaimed after 15 minutes. */
+export async function reserveCustomCaOrder(proposalId: number): Promise<CustomCaOrder | undefined> {
+  await databaseReady;
+  const result = await pool.query(
+    `UPDATE custom_ca_orders SET status = 'reserved', reserved_at = NOW()
+     WHERE proposal_id = $1
+       AND (status = 'ready' OR (status = 'reserved' AND reserved_at < NOW() - INTERVAL '15 minutes'))
+     RETURNING *`,
+    [proposalId]
+  );
+  return result.rows[0] ? mapCustomCaOrder(result.rows[0]) : undefined;
+}
+
+export async function markCustomCaOrderUsed(proposalId: number): Promise<void> {
+  await databaseReady;
+  await pool.query("UPDATE custom_ca_orders SET status = 'used', used_at = NOW() WHERE proposal_id = $1", [proposalId]);
+}
+
+export async function releaseCustomCaOrder(proposalId: number): Promise<void> {
+  await databaseReady;
+  await pool.query(
+    "UPDATE custom_ca_orders SET status = 'ready', reserved_at = NULL WHERE proposal_id = $1 AND status = 'reserved'",
+    [proposalId]
+  );
+}
+
+export async function cancelCustomCaOrder(proposalId: number): Promise<void> {
+  await databaseReady;
+  await pool.query(
+    "UPDATE custom_ca_orders SET status = 'cancelled' WHERE proposal_id = $1 AND status IN ('pending', 'ready')",
+    [proposalId]
+  );
+}
+
+function mapCustomCaOrder(row: QueryResultRow): CustomCaOrder {
+  return {
+    proposalId: Number(row.proposal_id),
+    chatId: String(row.chat_id),
+    status: String(row.status) as CustomCaOrder["status"],
+    address: row.address ? String(row.address) : undefined,
+    encryptedSecretKey: row.encrypted_secret_key ? String(row.encrypted_secret_key) : undefined,
+    createdAt: asIso(row.created_at),
+    readyAt: row.ready_at ? asIso(row.ready_at) : undefined
+  };
 }
 
 export async function markLaunched(id: number, signature?: string): Promise<Proposal | undefined> {

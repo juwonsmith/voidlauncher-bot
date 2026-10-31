@@ -24,7 +24,11 @@ export const ideaSchema = z.object({
   devBuySol: z.number().positive().max(5).optional(),
   devBuyEth: z.number().positive().max(5).optional(),
   pumpfunCashback: z.boolean().optional(),
-  pumpfunFeeShares: z.string().max(500).optional()
+  pumpfunFeeShares: z.string().max(500).optional(),
+  // Only the wizard sets these, after quoting the price; the paste format never reads them.
+  customCaPosition: z.enum(["start", "end"]).optional(),
+  customCaPattern: z.string().min(1).max(8).optional(),
+  customCaFeeSol: z.number().nonnegative().optional()
 });
 
 export function parseIdea(text: string): CoinIdeaInput {
