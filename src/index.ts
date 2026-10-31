@@ -90,11 +90,14 @@ import {
   customCaFeeSol,
   customCaKeypairProblem,
   describeCustomCa,
+  describeLengths,
   expectedAttempts,
+  FAST_FIRST_CHARACTERS_LABEL,
   formatSearchTime,
   normalizeCustomCaPattern,
   parseCustomCaFees,
   quoteCustomCa,
+  typicalSearchTime,
   type CustomCaPosition,
   type CustomCaPricing,
   type CustomCaRequest
@@ -197,6 +200,20 @@ bot.command("ping", (ctx) => {
 
 bot.command("commands", (ctx) => {
   return ctx.reply(commandHelpMessage(), telegramReplyOptions);
+});
+
+bot.command("customca", (ctx) => {
+  if (!customCaEnabled) return ctx.reply("Custom CAs are not available right now.");
+  return ctx.reply(
+    [
+      "<b>Custom CA</b>",
+      "",
+      customCaInfoMessage(),
+      "",
+      "Order one in <code>/idea</code> for a Pump.fun or Bonk launch. It's offered after the dev buy step."
+    ].join("\n"),
+    telegramReplyOptions
+  );
 });
 
 bot.command("deletecheck", async (ctx) => {
@@ -2290,7 +2307,13 @@ async function applyWizardText(ctx: Context, draft: Draft, value: string): Promi
     draft.data.pumpfunFeeShares = feeSplitFromPercent(draft.customFeeWallet, percent);
   } else if (draft.step === "customCaText") {
     const position = draft.customCaPosition ?? "end";
-    const quote = quoteCustomCa({ position, pattern: normalizeCustomCaPattern(position, value) }, customCaPricing);
+    let quote: ReturnType<typeof quoteCustomCa>;
+    try {
+      quote = quoteCustomCa({ position, pattern: normalizeCustomCaPattern(position, value) }, customCaPricing);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`${message}\n\nReply to my question above with different text, or send /skip for a normal CA.`);
+    }
     draft.data.customCaPosition = quote.position;
     draft.data.customCaPattern = quote.pattern;
     draft.data.customCaFeeSol = quote.feeSol;
@@ -2348,6 +2371,37 @@ function nextDraftStep(draft: Draft): DraftStep {
   return draft.step;
 }
 
+/** Prices, waits and rules, shown by /customca and at the top of the wizard's Custom CA step. */
+function customCaInfoMessage(): string {
+  const prices = [...customCaPricing.feesByLength.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(
+      ([length, fee]) =>
+        `• ${length} characters: <b>${fee} SOL</b>, usually ready in ${typicalSearchTime(length, customCaPricing.keysPerSecond)}`
+    );
+
+  return [
+    "Make your token's CA start or end with your own text, like <code>…pepe</code> or <code>…doge</code>.",
+    "",
+    ...prices,
+    "",
+    "<b>Good to know</b>",
+    "• <b>Ends with…</b> works for any text.",
+    `• <b>Starts with…</b> is only fast when your text begins with <b>${FAST_FIRST_CHARACTERS_LABEL}</b>.`,
+    ...customCaTextRules(),
+    "• The fee is paid from the launch wallet only after a successful launch. A normal CA is free.",
+    "• The full CA stays hidden until launch."
+  ].join("\n");
+}
+
+function customCaTextRules(): string[] {
+  return [
+    `• ${describeLengths(customCaPricing.feesByLength)} letters or numbers.`,
+    "• CAs never contain 0, O, I or l, so <code>MOON</code> won't work but <code>moon</code> will.",
+    "• Upper and lower case must match exactly: <code>pepe</code> and <code>PEPE</code> are different."
+  ];
+}
+
 function customCaStepOrPreview(draft: Draft): DraftStep {
   const supported = draft.data.launchpad === "pumpfun" || draft.data.launchpad === "bonk";
   return customCaEnabled && supported ? "customCa" : "preview";
@@ -2394,20 +2448,26 @@ function wizardQuestion(step: DraftStep, draft?: Draft): {
       "Choose Pump.fun creator-fee sharing. This can lock reward distribution once configured.",
     feeShareWallet: "Send the wallet that should receive part of the creator fees.",
     feeSharePercent: "Choose what percent this wallet should receive. The remaining percent goes to the creator/dev wallet.",
-    customCa: [
-      "Want a custom contract address? Pick whether the CA should start or end with your text, or keep a normal CA for free.",
-      "",
-      ...[...customCaPricing.feesByLength.entries()]
-        .sort(([a], [b]) => a - b)
-        .map(([length, fee]) => `${length} characters: <b>${fee} SOL</b>`),
-      "",
-      "The fee is paid from the launch wallet only after a successful launch."
-    ].join("\n"),
-    customCaText: [
-      `Reply with the text the CA should ${draft?.customCaPosition === "start" ? "start" : "end"} with.`,
-      "Letters and numbers only, except 0, O, I and l. Upper and lower case must match exactly.",
-      "Send <code>/skip</code> to keep a normal CA instead."
-    ].join("\n")
+    customCa: [customCaInfoMessage(), "", "Pick an option below."].join("\n"),
+    customCaText:
+      draft?.customCaPosition === "start"
+        ? [
+            "Reply with the text your CA should <b>start</b> with.",
+            "Example: <code>Bonk</code> gives <code>Bonk…</code>",
+            "",
+            `• Begin with <b>${FAST_FIRST_CHARACTERS_LABEL}</b> for a fast result. Text like <code>moon</code> or <code>PEPE</code> may be refused as too slow; use Ends with… for those.`,
+            ...customCaTextRules(),
+            "",
+            "Send <code>/skip</code> to keep a normal CA instead."
+          ].join("\n")
+        : [
+            "Reply with the text your CA should <b>end</b> with.",
+            "Example: <code>pepe</code> gives <code>…pepe</code>",
+            "",
+            ...customCaTextRules(),
+            "",
+            "Send <code>/skip</code> to keep a normal CA instead."
+          ].join("\n")
   };
 
   const skipButton = (field: string): InlineKeyboardButton => ({
@@ -2469,8 +2529,13 @@ function wizardQuestion(step: DraftStep, draft?: Draft): {
     ]
   };
 
+  const titles: Partial<Record<DraftStep, string>> = {
+    customCa: "Custom CA (optional)",
+    customCaText: "Custom CA text"
+  };
+
   return {
-    text: wizardQuestionMessage(`Step: ${step}`, questions[step]),
+    text: wizardQuestionMessage(titles[step] ?? `Step: ${step}`, questions[step]),
     keyboard: keyboards[step],
     forceReply:
       step === "name" ||
@@ -2880,6 +2945,7 @@ async function launchBotWithRetry(): Promise<void> {
 async function setupBotCommands(): Promise<void> {
   await bot.telegram.setMyCommands([
     { command: "idea", description: "Open the coin idea wizard" },
+    ...(customCaEnabled ? [{ command: "customca", description: "Custom CA prices and tips" }] : []),
     { command: "commands", description: "Show bot commands" },
     { command: "review", description: "Review pending launch ideas" },
     { command: "groupwallet", description: "Create/show the group launch wallet" },

@@ -144,6 +144,7 @@ export function commandHelpMessage(): string {
     "",
     "<b>Everyone</b>",
     "<code>/idea</code> - open the guided coin idea wizard",
+    "<code>/customca</code> - custom CA prices and tips",
     "<code>/proposal &lt;id&gt;</code> - view a proposal",
     "<code>/help</code> - show instructions",
     "",
