@@ -199,6 +199,24 @@ Each extra character makes the search about 58 times longer. On a 4-core PC (abo
 
 If Node can't reach the bot from a PC with antivirus TLS scanning, set `NODE_EXTRA_CA_CERTS` to the antivirus root certificate.
 
+### Running the grinder on a Linux server
+
+A small server keeps custom CAs available around the clock. Any Ubuntu 24.04 (or Debian 12) server with 4+ CPU cores works, for example Contabo Cloud VPS 10/20 or Hetzner CX33. It needs no open ports besides SSH.
+
+1. Create the server with Ubuntu 24.04 and your SSH key (or the root password the provider sends).
+2. Make sure `GRINDER_API_TOKEN` and `CUSTOM_CA_BOT_URL` are set in your local `.env`, and the same token is set on Render.
+3. From this folder on your PC, run:
+
+```bash
+npm run grinder:deploy -- root@SERVER_IP
+```
+
+This installs Node.js, Rust and the grinder, measures the server's speed, and runs it as the `voidlauncher-grinder` systemd service, which restarts after crashes and reboots. It prints the measured speed; set `CUSTOM_CA_KEYS_PER_SECOND` on Render to that number. Only the grinder files and those two settings are sent; the server never gets the bot token, database URL or wallet key. Run the same command again to update the server after code changes.
+
+- Watch it: `ssh root@SERVER_IP journalctl -u voidlauncher-grinder -f`
+- Stop it: `ssh root@SERVER_IP systemctl disable --now voidlauncher-grinder`
+- If you log in as a user other than root (such as `ubuntu`), it needs passwordless sudo, which cloud images usually have.
+
 ## Pump.fun CA Suffix
 
 Pump.fun token addresses that end in `pump` are vanity mint addresses. They are not automatic when a normal random mint keypair is generated.
