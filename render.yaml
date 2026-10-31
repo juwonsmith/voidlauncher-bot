@@ -12,8 +12,9 @@ services:
         value: 20.18.0
       - key: DATABASE_URL
         sync: false
+      # Set in the Render dashboard so a Blueprint sync never flips live mode on or off.
       - key: DRY_RUN
-        value: "true"
+        sync: false
       - key: ALLOW_GROUP_ADMINS
         value: "true"
       - key: ROBINHOOD_RPC_URL
