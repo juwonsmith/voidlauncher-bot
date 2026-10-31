@@ -21,8 +21,9 @@ services:
         value: https://rpc.mainnet.chain.robinhood.com
       - key: ROBINHOOD_PLATFORM_TREASURY_WALLET
         value: 0x8fd406e046C6A81aFa85E0b1638d417b6161dE5e
+      # Your price per Robinhood launch; set in the Render dashboard so a Blueprint sync never resets it.
       - key: ROBINHOOD_PLATFORM_FEE_ETH
-        value: "0.005"
+        sync: false
       - key: DEFAULT_DEV_BUY_ETH
         value: "0.01"
       - key: TELEGRAM_BOT_TOKEN
