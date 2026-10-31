@@ -11,6 +11,7 @@ import {
   countAvailableVanityMints,
   countSuccessfulLaunchesSince,
   claimNextLaunchJob,
+  nextLaunchJobRunAt,
   completeLaunchJob,
   createProposal,
   enqueueLaunchJob,
@@ -73,9 +74,11 @@ import {
   getWalletSecretBase58,
   getWalletSummary,
   getWalletView,
+  assertWalletEncryptionKeyReady,
   type WalletView
 } from "./wallets.js";
 import { logError, logInfo } from "./logger.js";
+import { createLaunchJobWorker } from "./launchJobWorker.js";
 
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
 const drafts = new Map<string, Draft>();
@@ -84,7 +87,12 @@ const activeLaunches = new Set<string>();
 const rateBuckets = new Map<string, { count: number; resetAt: number }>();
 const startedAt = new Date();
 let databaseHealthy = false;
-let launchJobWorkerBusy = false;
+const launchJobWorker = createLaunchJobWorker({
+  claimNext: () => claimNextLaunchJob(config.LAUNCH_JOB_MAX_ATTEMPTS),
+  execute: executeLaunchJob,
+  nextRunAt: () => nextLaunchJobRunAt(config.LAUNCH_JOB_MAX_ATTEMPTS),
+  onError: (error) => logError("launch_job_worker_failed", error)
+});
 
 type DraftStep =
   | "launchpad"
@@ -768,13 +776,17 @@ bot.command("status", async (ctx) => {
   const attempts = await recentLaunchAttempts(6);
   const jobs = await recentLaunchJobs(6);
   const uptimeSeconds = Math.floor((Date.now() - startedAt.getTime()) / 1000);
+  const nextQueueWake = launchJobWorker.nextWakeAt();
   const lines = [
     "<b>Bot Status</b>",
     "",
     `Mode: <b>${config.DRY_RUN ? "DRY RUN" : "LIVE"}</b>`,
     `Uptime: <b>${Math.floor(uptimeSeconds / 60)}m ${uptimeSeconds % 60}s</b>`,
     `Active launches: <b>${activeLaunches.size}</b>`,
-    `Queue worker: <b>${launchJobWorkerBusy ? "busy" : "idle"}</b>`,
+    `Queue worker: <b>${launchJobWorker.isBusy() ? "busy" : "idle"}</b>`,
+    `Next queue check: <b>${
+      nextQueueWake ? `in ${Math.max(0, Math.ceil((nextQueueWake.getTime() - Date.now()) / 1000))}s` : "when a launch is queued"
+    }</b>`,
     `Rate buckets: <b>${rateBuckets.size}</b>`,
     `Health port: <b>${config.HEALTHCHECK_PORT || "off"}</b>`,
     "",
@@ -894,7 +906,7 @@ bot.action(/^confirm_launch:(api|group|personal):(\d+)$/, async (ctx) => {
     `🧾 <b>Launch queued</b>\nJob: <code>${job.id}</code>\nProposal: <code>${id}</code>\nMode: <b>${escapeHtml(mode)}</b>`,
     telegramReplyOptions
   );
-  void processLaunchJobs();
+  void launchJobWorker.run();
 });
 
 bot.action(/^cancel_launch:(\d+)$/, async (ctx) => {
@@ -1404,20 +1416,6 @@ async function runPersonalLaunch(ctx: Context, id: number): Promise<void> {
   });
 }
 
-async function processLaunchJobs(): Promise<void> {
-  if (launchJobWorkerBusy) return;
-  launchJobWorkerBusy = true;
-  try {
-    while (true) {
-      const job = await claimNextLaunchJob(config.LAUNCH_JOB_MAX_ATTEMPTS);
-      if (!job) return;
-      await executeLaunchJob(job);
-    }
-  } finally {
-    launchJobWorkerBusy = false;
-  }
-}
-
 async function executeLaunchJob(job: {
   id: number;
   proposalId: number;
@@ -1428,7 +1426,7 @@ async function executeLaunchJob(job: {
 }): Promise<void> {
   const lockKey = job.mode === "personal" ? `personal:${job.actorId}:${job.proposalId}` : `proposal:${job.proposalId}`;
   if (activeLaunches.has(lockKey)) {
-    await failLaunchJob(job.id, "Launch is already active; retrying shortly.", config.LAUNCH_JOB_POLL_MS * 2, config.LAUNCH_JOB_MAX_ATTEMPTS);
+    await failLaunchJob(job.id, "Launch is already active; retrying shortly.", config.LAUNCH_RETRY_DELAY_MS, config.LAUNCH_JOB_MAX_ATTEMPTS);
     return;
   }
 
@@ -2615,13 +2613,12 @@ process.once("SIGINT", () => void shutdown("SIGINT"));
 process.once("SIGTERM", () => void shutdown("SIGTERM"));
 
 async function startBot(): Promise<void> {
+  assertWalletEncryptionKeyReady();
   await assertDatabaseReady();
   databaseHealthy = true;
   logInfo("database_connected", { provider: "postgres" });
-  setInterval(
-    () => void processLaunchJobs().catch((error) => logError("launch_job_worker_tick_failed", error)),
-    config.LAUNCH_JOB_POLL_MS
-  );
+  // Resume jobs queued before a restart; the worker schedules its own wakeups from here.
+  void launchJobWorker.run();
   await launchBotWithRetry();
 }
 

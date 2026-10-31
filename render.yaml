@@ -2,7 +2,7 @@ services:
   - type: web
     name: voidlauncher-bot
     env: node
-    plan: free
+    plan: 0.5c-512mb
     region: frankfurt
     buildCommand: npm install && npm run build
     startCommand: HEALTHCHECK_PORT=$PORT npm start

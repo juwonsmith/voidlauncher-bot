@@ -533,12 +533,15 @@ async function getActiveLaunchJob(proposalId: number, mode: LaunchJob["mode"]): 
   return result.rows[0] ? mapLaunchJob(result.rows[0]) : undefined;
 }
 
+// A running job older than this is assumed to belong to a crashed process and is requeued.
+const STALE_LAUNCH_JOB_INTERVAL = "15 minutes";
+
 export async function claimNextLaunchJob(maxAttempts: number): Promise<LaunchJob | undefined> {
   await databaseReady;
   return withTransaction(async (client) => {
     await client.query(
       `UPDATE launch_jobs SET status = 'queued', started_at = NULL
-       WHERE status = 'running' AND started_at < NOW() - INTERVAL '15 minutes'`
+       WHERE status = 'running' AND started_at < NOW() - INTERVAL '${STALE_LAUNCH_JOB_INTERVAL}'`
     );
     const result = await client.query(
       `SELECT * FROM launch_jobs
@@ -555,6 +558,21 @@ export async function claimNextLaunchJob(maxAttempts: number): Promise<LaunchJob
     );
     return claimed.rows[0] ? mapLaunchJob(claimed.rows[0]) : undefined;
   });
+}
+
+/** When the next queued job becomes claimable or a running job turns stale, whichever is first. */
+export async function nextLaunchJobRunAt(maxAttempts: number): Promise<Date | undefined> {
+  await databaseReady;
+  const result = await pool.query(
+    `SELECT MIN(
+       CASE WHEN status = 'queued' THEN run_after ELSE started_at + INTERVAL '${STALE_LAUNCH_JOB_INTERVAL}' END
+     ) AS next_run_at
+     FROM launch_jobs
+     WHERE (status = 'queued' AND attempts < $1) OR status = 'running'`,
+    [maxAttempts]
+  );
+  const nextRunAt = result.rows[0]?.next_run_at;
+  return nextRunAt ? new Date(nextRunAt) : undefined;
 }
 
 export async function completeLaunchJob(id: number, signature?: string, mint?: string): Promise<void> {

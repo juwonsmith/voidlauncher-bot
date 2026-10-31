@@ -6,6 +6,10 @@ This blueprint deploys the bot as a Render Web Service and binds the health serv
 
 The bot uses Postgres for proposals, encrypted wallet records, audits, vanity mints, and launch jobs. Render's ephemeral filesystem is used only for temporary logs. Never deploy without `DATABASE_URL` and never change `WALLET_ENCRYPTION_KEY` after wallets have been created.
 
+The bot refuses to start on Render without `WALLET_ENCRYPTION_KEY`, because a key generated on Render's disk would be lost on the next restart.
+
+The blueprint uses the paid `0.5c-512mb` instance ($7/month). Free web services sleep after 15 minutes without inbound HTTP traffic, and a Telegram bot that polls for updates receives none, so the free plan cannot keep the bot online.
+
 ## Deploy Steps
 
 1. Push this repo to GitHub.

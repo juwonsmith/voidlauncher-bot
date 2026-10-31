@@ -3,7 +3,7 @@
 ## What Is Production-Ready Now
 
 - Launches are queued in `launch_jobs`, so a confirmed launch request survives a bot restart.
-- A worker polls the database and resumes queued or stale running jobs.
+- The queue worker runs when a launch is queued, on startup, and when a retry or stale running job comes due. It does not poll, so a scale-to-zero database such as Neon can sleep between launches.
 - Each launch has a persistent `launch_attempts` record.
 - Admin/security actions are written to `audit_logs`.
 - Logs are written as JSONL in `logs/app.jsonl` and `logs/error.jsonl`.

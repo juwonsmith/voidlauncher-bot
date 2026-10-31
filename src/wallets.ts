@@ -348,6 +348,19 @@ function robinhoodStorageScope(scope: "group" | "user"): WalletScope {
   return scope === "group" ? "group_evm" : "user_evm";
 }
 
+/** Fails startup instead of silently creating a key that a redeploy would throw away. */
+export function assertWalletEncryptionKeyReady(): void {
+  if (config.WALLET_ENCRYPTION_KEY) {
+    walletEncryptionKey();
+    return;
+  }
+  if (config.RENDER) {
+    throw new Error(
+      "WALLET_ENCRYPTION_KEY is required on Render. Render wipes local files on every restart and deploy, so a generated key would leave encrypted wallets unrecoverable."
+    );
+  }
+}
+
 function walletEncryptionKey(): Buffer {
   if (!config.WALLET_ENCRYPTION_KEY) {
     return localWalletKey();

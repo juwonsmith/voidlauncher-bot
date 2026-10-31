@@ -60,7 +60,6 @@ const envSchema = z.object({
   LAUNCH_RETRY_DELAY_MS: z.coerce.number().int().positive().default(3000),
   LAUNCH_CONFIRM_ATTEMPTS: z.coerce.number().int().positive().default(20),
   LAUNCH_CONFIRM_DELAY_MS: z.coerce.number().int().positive().default(3000),
-  LAUNCH_JOB_POLL_MS: z.coerce.number().int().positive().default(2000),
   LAUNCH_JOB_MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),
   REQUIRE_LAUNCH_CONFIRMATION: z
     .string()
@@ -75,7 +74,12 @@ const envSchema = z.object({
     .transform((value) => value.toLowerCase() !== "false"),
   HEALTHCHECK_PORT: z.coerce.number().int().min(0).default(0),
   LOG_DIR: z.string().default("./logs"),
-  WALLET_ENCRYPTION_KEY: z.string().optional()
+  WALLET_ENCRYPTION_KEY: z.string().optional(),
+  // Render sets RENDER=true on every service; its filesystem is wiped on each restart and deploy.
+  RENDER: z
+    .string()
+    .default("false")
+    .transform((value) => value.toLowerCase() === "true")
 });
 
 export const config = envSchema.parse(process.env);
