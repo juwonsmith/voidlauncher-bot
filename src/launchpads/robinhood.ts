@@ -9,7 +9,8 @@ import {
   parseEther,
   parseEventLogs,
   zeroAddress,
-  type Address
+  type Address,
+  type Log
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { config } from "../config.js";
@@ -94,6 +95,31 @@ const bagsFactoryAbi = [
   }
 ] as const;
 
+function robinhoodPublicClient() {
+  return createPublicClient({
+    chain: robinhoodChain,
+    transport: http(config.ROBINHOOD_RPC_URL, { batch: true }),
+    batch: { multicall: true },
+    pollingInterval: 500
+  });
+}
+
+/** Bags' current creation fee in ETH. The factory owner can change it, so read it per launch. */
+export async function readRobinhoodCreationFeeEth(): Promise<number> {
+  const fee = await robinhoodPublicClient().readContract({
+    address: ROBINHOOD_FACTORY,
+    abi: bagsFactoryAbi,
+    functionName: "creationFee"
+  });
+  return Number(formatEther(fee));
+}
+
+/** The TokenCreated event in a launch receipt, or undefined if none decodes with this ABI. */
+export function findTokenCreated(logs: Log[]) {
+  const [created] = parseEventLogs({ abi: bagsFactoryAbi, logs, eventName: "TokenCreated" });
+  return created?.args;
+}
+
 export async function launchWithRobinhoodBags(
   proposal: Proposal,
   privateKey: `0x${string}`,
@@ -107,12 +133,7 @@ export async function launchWithRobinhoodBags(
     throw new Error("Robinhood signer private key does not match wallet address.");
   }
 
-  const publicClient = createPublicClient({
-    chain: robinhoodChain,
-    transport: http(config.ROBINHOOD_RPC_URL, { batch: true }),
-    batch: { multicall: true },
-    pollingInterval: 500
-  });
+  const publicClient = robinhoodPublicClient();
   const walletClient = createWalletClient({
     account,
     chain: robinhoodChain,
@@ -156,12 +177,10 @@ export async function launchWithRobinhoodBags(
   const receipt = await publicClient.waitForTransactionReceipt({ hash, timeout: 120_000 });
   if (receipt.status !== "success") throw new Error("Robinhood launch transaction reverted on-chain.");
 
-  const [created] = parseEventLogs({
-    abi: bagsFactoryAbi,
-    logs: receipt.logs,
-    eventName: "TokenCreated"
-  });
-  if (!created) throw new Error("Robinhood launch confirmed but no TokenCreated event was found.");
+  // The ETH is already spent at this point, so a missing event (say, after a Bags contract upgrade) must not
+  // turn a successful launch into a reported failure; the transaction link still shows the new token.
+  const created = findTokenCreated(receipt.logs);
+  if (!created) console.warn(`[launch:${proposal.id}] Robinhood launch ${hash} succeeded but TokenCreated did not decode`);
 
   let platformFeeUrl: string | undefined;
   let platformFeeError: string | undefined;
@@ -178,18 +197,20 @@ export async function launchWithRobinhoodBags(
     }
   }
 
-  const token = created.args.token as Address;
   return {
     launchpad: "robinhood",
     dryRun: false,
-    mint: token,
-    curve: created.args.curve as Address,
-    feeShare: created.args.feeShare as Address,
+    mint: created?.token as Address | undefined,
+    curve: created?.curve as Address | undefined,
+    feeShare: created?.feeShare as Address | undefined,
     signature: hash,
     explorerUrl: `https://robinhoodchain.blockscout.com/tx/${hash}`,
     metadataUri,
     platformFeeUrl,
     platformFeeError,
-    message: `Launched ${proposal.name} ($${proposal.symbol}) on Robinhood Chain.`
+    message: created
+      ? `Launched ${proposal.name} ($${proposal.symbol}) on Robinhood Chain.`
+      : `Launched ${proposal.name} ($${proposal.symbol}) on Robinhood Chain. The bot couldn't read the new token's address, ` +
+        "so open the transaction on Blockscout to find it."
   };
 }

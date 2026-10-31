@@ -38,7 +38,7 @@ import {
 } from "./db.js";
 import { launchProposal } from "./launchpads/index.js";
 import { launchWithBags } from "./launchpads/bags.js";
-import { launchWithRobinhoodBags } from "./launchpads/robinhood.js";
+import { launchWithRobinhoodBags, readRobinhoodCreationFeeEth } from "./launchpads/robinhood.js";
 import {
   launchWithPumpFunSdk,
   launchWithPumpPortalApiKey,
@@ -1290,9 +1290,7 @@ async function sendLaunchConfirmation(ctx: Context, mode: LaunchMode, id: number
   const proposal = await getProposal(id);
   if (!proposal) return void (await ctx.reply(`Proposal #${id} not found.`));
   if (proposal.launchpad === "robinhood") {
-    const devBuyEth = proposal.devBuyEth ?? config.DEFAULT_DEV_BUY_ETH;
-    const platformFeeEth = config.ROBINHOOD_PLATFORM_FEE_ETH > 0 ? config.ROBINHOOD_PLATFORM_FEE_ETH : 0;
-    const minimumTotal = devBuyEth + platformFeeEth + 0.025;
+    const cost = await robinhoodLaunchCost(proposal);
 
     await ctx.reply(
       [
@@ -1302,10 +1300,10 @@ async function sendLaunchConfirmation(ctx: Context, mode: LaunchMode, id: number
         `Mode: <b>${mode === "api" ? "API" : mode === "group" ? "Group Wallet" : "Personal Wallet"}</b>`,
         "Launchpad: <b>Robinhood Chain / Bags</b>",
         "",
-        `Initial buy: <b>${devBuyEth} ETH</b>`,
-        "Bags creation fee: <b>read live before launch</b>",
-        platformFeeEth > 0 ? `Platform fee: <b>${platformFeeEth} ETH</b>` : `Platform fee: <b>off</b>`,
-        `Suggested wallet minimum: <b>${minimumTotal.toFixed(6)} ETH</b>`,
+        `Initial buy: <b>${cost.devBuyEth} ETH</b>`,
+        `Bags creation fee: <b>${cost.creationFeeEth === undefined ? "couldn't be read right now" : `${cost.creationFeeEth} ETH`}</b>`,
+        cost.platformFeeEth > 0 ? `Platform fee: <b>${cost.platformFeeEth} ETH</b>` : `Platform fee: <b>off</b>`,
+        `Suggested wallet minimum: <b>${cost.minimumEth.toFixed(6)} ETH</b> (includes gas)`,
         "",
         "Only continue if the metadata, image, wallet, and spend are correct."
       ].join("\n"),
@@ -1848,11 +1846,28 @@ async function assertPersonalLaunchReady(proposal: Proposal, walletAddress: stri
   }
 }
 
-async function assertRobinhoodLaunchReady(proposal: Proposal, walletAddress: string, mode: "group" | "personal"): Promise<void> {
-  const problems: string[] = [];
+// A Robinhood launch uses ~1.7M gas, about 0.00004 ETH at recent prices; this covers spikes and the fee transfer.
+const ROBINHOOD_GAS_BUFFER_ETH = 0.001;
+// Only used when the live creation fee can't be read: Bags' documented 0.02 ETH default plus gas.
+const ROBINHOOD_FALLBACK_FEE_AND_GAS_ETH = 0.025;
+
+/** What a Robinhood launch needs in the wallet: Bags' live creation fee, the initial buy, the platform fee and gas. */
+async function robinhoodLaunchCost(
+  proposal: Proposal
+): Promise<{ creationFeeEth?: number; devBuyEth: number; platformFeeEth: number; minimumEth: number }> {
   const devBuyEth = proposal.devBuyEth ?? config.DEFAULT_DEV_BUY_ETH;
   const platformFeeEth = config.ROBINHOOD_PLATFORM_FEE_ETH > 0 ? config.ROBINHOOD_PLATFORM_FEE_ETH : 0;
-  const estimatedMinimum = devBuyEth + platformFeeEth + 0.025;
+  const creationFeeEth = await readRobinhoodCreationFeeEth().catch((error) => {
+    console.warn(`[preflight:${proposal.id}] could not read the Bags creation fee: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  });
+  const feeAndGasEth = creationFeeEth === undefined ? ROBINHOOD_FALLBACK_FEE_AND_GAS_ETH : creationFeeEth + ROBINHOOD_GAS_BUFFER_ETH;
+  return { creationFeeEth, devBuyEth, platformFeeEth, minimumEth: devBuyEth + platformFeeEth + feeAndGasEth };
+}
+
+async function assertRobinhoodLaunchReady(proposal: Proposal, walletAddress: string, mode: "group" | "personal"): Promise<void> {
+  const problems: string[] = [];
+  const { platformFeeEth, minimumEth: estimatedMinimum } = await robinhoodLaunchCost(proposal);
 
   if (!proposal.image) problems.push("proposal has no image");
   if (!config.PINATA_JWT) problems.push("PINATA_JWT is missing");
