@@ -263,8 +263,9 @@ bot.command("groupwallet", async (ctx) => {
   if (!(await isBotAdmin(ctx))) return ctx.reply("Admin command only.");
 
   try {
-    const wallet = await withBalance(await getOrCreatePumpPortalWallet("group", String(ctx.chat.id)));
-    await replyWallet(ctx, "Group Launch Wallet", wallet);
+    const wallet = await getOrCreatePumpPortalWallet("group", String(ctx.chat.id));
+    // The address is what people need to fund the wallet, so a failed balance lookup still shows it.
+    await replyWallet(ctx, "Group Launch Wallet", await withBalance(wallet).catch((error) => withBalanceError(wallet, error)));
   } catch (error) {
     return ctx.reply(formatError(error), telegramReplyOptions);
   }
@@ -292,8 +293,8 @@ bot.command("rhgroupwallet", async (ctx) => {
   if (!(await isBotAdmin(ctx))) return ctx.reply("Admin command only.");
 
   try {
-    const wallet = await withEthBalance(await getOrCreateRobinhoodWallet("group", String(ctx.chat.id)));
-    await replyWallet(ctx, "Robinhood Group Wallet", wallet);
+    const wallet = await getOrCreateRobinhoodWallet("group", String(ctx.chat.id));
+    await replyWallet(ctx, "Robinhood Group Wallet", await withEthBalance(wallet).catch((error) => withBalanceError(wallet, error)));
   } catch (error) {
     return ctx.reply(formatError(error), telegramReplyOptions);
   }
@@ -318,8 +319,8 @@ bot.command("mywallet", async (ctx) => {
   if (!ctx.from) return ctx.reply("I could not identify you.");
 
   try {
-    const wallet = await withBalance(await getOrCreateWallet("user", String(ctx.from.id)));
-    await replyWallet(ctx, "Personal Launch Wallet", wallet);
+    const wallet = await getOrCreateWallet("user", String(ctx.from.id));
+    await replyWallet(ctx, "Personal Launch Wallet", await withBalance(wallet).catch((error) => withBalanceError(wallet, error)));
   } catch (error) {
     return ctx.reply(formatError(error), telegramReplyOptions);
   }
@@ -342,8 +343,8 @@ bot.command("rhmywallet", async (ctx) => {
   if (!ctx.from) return ctx.reply("I could not identify you.");
 
   try {
-    const wallet = await withEthBalance(await getOrCreateRobinhoodWallet("user", String(ctx.from.id)));
-    await replyWallet(ctx, "Robinhood Personal Wallet", wallet);
+    const wallet = await getOrCreateRobinhoodWallet("user", String(ctx.from.id));
+    await replyWallet(ctx, "Robinhood Personal Wallet", await withEthBalance(wallet).catch((error) => withBalanceError(wallet, error)));
   } catch (error) {
     return ctx.reply(formatError(error), telegramReplyOptions);
   }
