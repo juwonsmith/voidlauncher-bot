@@ -32,6 +32,9 @@ services:
         sync: false
       - key: WALLET_ENCRYPTION_KEY
         sync: false
+      # Older keys that existing wallets were encrypted with, comma-separated; tried after WALLET_ENCRYPTION_KEY.
+      - key: WALLET_ENCRYPTION_LEGACY_KEYS
+        sync: false
       - key: PUMPFUN_SIGNER_PRIVATE_KEY
         sync: false
       - key: PUMPPORTAL_API_KEY

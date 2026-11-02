@@ -8,6 +8,8 @@ The bot uses Postgres for proposals, encrypted wallet records, audits, vanity mi
 
 The bot refuses to start on Render without `WALLET_ENCRYPTION_KEY`, because a key generated on Render's disk would be lost on the next restart.
 
+Wallets keep the key they were created with. If some were created under a different key, for example by a local bot that had no `WALLET_ENCRYPTION_KEY` and so used `data/wallet.key`, put those keys in `WALLET_ENCRYPTION_LEGACY_KEYS`, comma-separated. The bot tries them after `WALLET_ENCRYPTION_KEY`, and new wallets always use `WALLET_ENCRYPTION_KEY`. Until then, those wallets can't launch, claim fees or be exported, and their wallet cards say not to deposit.
+
 The blueprint uses the paid `0.5c-512mb` instance ($7/month). Free web services sleep after 15 minutes without inbound HTTP traffic, and a Telegram bot that polls for updates receives none, so the free plan cannot keep the bot online.
 
 ## Deploy Steps
@@ -37,7 +39,7 @@ The blueprint uses the paid `0.5c-512mb` instance ($7/month). Free web services 
 
 ## Migrate Existing SQLite Data
 
-Keep the existing `data/bot.sqlite` and the same `WALLET_ENCRYPTION_KEY`. Put the new Postgres connection string in local `.env` as `DATABASE_URL`, stop every running bot instance, then run:
+Keep the existing `data/bot.sqlite` and the key its wallets were encrypted with: `WALLET_ENCRYPTION_KEY` from local `.env` or, if that was empty, the contents of `data/wallet.key`. Put the new Postgres connection string in local `.env` as `DATABASE_URL`, stop every running bot instance, then run:
 
 Before redeploying, use the existing bot's DM wallet-export commands for any funded wallet that exists only on Render. A Render redeploy discards its current ephemeral SQLite file, so do not assume that file will survive the switch.
 
@@ -45,7 +47,7 @@ Before redeploying, use the existing bot's DM wallet-export commands for any fun
 npm run db:migrate:sqlite
 ```
 
-The migration is transactional and can be rerun. It preserves proposal IDs, encrypted wallet records, audits, launch attempts, queued jobs, and vanity mints. After it completes, add the same `DATABASE_URL` and `WALLET_ENCRYPTION_KEY` to Render and deploy.
+The migration is transactional and can be rerun. It preserves proposal IDs, encrypted wallet records, audits, launch attempts, queued jobs, and vanity mints. The wallet records stay encrypted with the local key. After it completes, add the same `DATABASE_URL` to Render, and that key as `WALLET_ENCRYPTION_KEY` (or as `WALLET_ENCRYPTION_LEGACY_KEYS` if Render already has its own key), then deploy.
 
 ## Avoid Telegram 409 Conflict
 

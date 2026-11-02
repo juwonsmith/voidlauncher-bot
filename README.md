@@ -137,7 +137,7 @@ Server hygiene:
 
 - Rotate any Telegram token, API key, or private key that was ever pasted into chat.
 - Keep `.env`, `data/`, `logs/`, and wallet backups out of GitHub.
-- Back up `WALLET_ENCRYPTION_KEY` and your Postgres database; losing the encryption key can make encrypted wallets unrecoverable.
+- Back up `WALLET_ENCRYPTION_KEY` (and any `WALLET_ENCRYPTION_LEGACY_KEYS`) and your Postgres database; losing the encryption key can make encrypted wallets unrecoverable. Wallets made under an older key need it listed in `WALLET_ENCRYPTION_LEGACY_KEYS`.
 - Use AWS security groups to allow SSH only from your IP. The bot uses Telegram polling, so it does not need public HTTP/HTTPS unless you expose `HEALTHCHECK_PORT`.
 - Add log rotation on AWS, for example `pm2 install pm2-logrotate`.
 

@@ -374,7 +374,7 @@ bot.command("exportmywallet", async (ctx) => {
     if (!exported.solana && !exported.robinhood) {
       return ctx.reply("You don't have a personal wallet yet. Create one with /mywallet or /rhmywallet.");
     }
-    audit(ctx, "wallet_export_user", undefined, { solana: exported.solana?.address, robinhood: exported.robinhood?.address });
+    audit(ctx, "wallet_export_user", undefined, exportAuditDetails(exported));
     return ctx.reply(walletExportMessage("Your personal wallets", exported), telegramReplyOptions);
   } catch (error) {
     return ctx.reply(formatError(error), telegramReplyOptions);
@@ -2702,8 +2702,10 @@ function walletMessage(title: string, wallet: WalletView): string {
           ? `Balance: unavailable right now (${escapeHtml(wallet.balanceError)})`
           : `Balance: use <code>/groupbalance</code> to refresh`
         : `Balance: <b>${wallet.balanceSol.toFixed(6)} SOL</b>`;
-  const fundingText =
-    wallet.provider === "evm"
+  // A wallet the bot can't decrypt can't launch, claim or be exported, so it mustn't invite deposits.
+  const fundingText = wallet.keyError
+    ? `&#9888; <b>Don't deposit here yet.</b> ${escapeHtml(wallet.keyError)}`
+    : wallet.provider === "evm"
       ? "Deposit Robinhood Chain ETH to this address. The private key is encrypted and never shown in Telegram."
       : "Deposit SOL to this address. Pump.fun signs with this encrypted wallet; Bonk uses its encrypted API key. The private key is never shown in Telegram.";
 
@@ -2771,9 +2773,10 @@ async function replyLaunchResult(ctx: Context, result: LaunchResult): Promise<vo
   });
 }
 
+/** Each chain's wallet with its key, or with the reason the key couldn't be decrypted. */
 interface ExportedWallets {
-  solana?: { address: string; secretKey: string; apiKey?: string };
-  robinhood?: { address: string; privateKey: string };
+  solana?: { address: string; secretKey?: string; apiKey?: string; error?: string };
+  robinhood?: { address: string; privateKey?: string; error?: string };
 }
 
 /** A scope's Solana and Robinhood keys, whichever exist. The PumpPortal API key goes to configured admins only. */
@@ -2783,30 +2786,51 @@ async function exportWallets(scope: "group" | "user", scopeId: string, includeAp
     getWalletSummary(solanaScope, scopeId),
     getWalletSummary(scope === "group" ? "group_evm" : "user_evm", scopeId)
   ]);
+  // Each chain on its own, so a key the bot can't decrypt doesn't hold back the other chain's.
+  const failed = (address: string) => (error: unknown) => ({
+    address,
+    error: error instanceof Error ? error.message : String(error)
+  });
+  const exportSolana = async () => ({
+    ...(await exportWalletSecretBase58(solanaScope, scopeId)),
+    apiKey: includeApiKey && solanaWallet?.hasApiKey ? (await getPumpPortalApiKey(scope, scopeId)).apiKey : undefined
+  });
   return {
-    solana: solanaWallet
-      ? {
-          ...(await exportWalletSecretBase58(solanaScope, scopeId)),
-          apiKey: includeApiKey && solanaWallet.hasApiKey ? (await getPumpPortalApiKey(scope, scopeId)).apiKey : undefined
-        }
-      : undefined,
-    robinhood: robinhoodWallet ? await getRobinhoodWalletSecret(scope, scopeId) : undefined
+    solana: solanaWallet ? await exportSolana().catch(failed(solanaWallet.address)) : undefined,
+    robinhood: robinhoodWallet ? await getRobinhoodWalletSecret(scope, scopeId).catch(failed(robinhoodWallet.address)) : undefined
+  };
+}
+
+/** What the audit log records for an export: the addresses whose keys went out, and those that couldn't be decrypted. */
+function exportAuditDetails(exported: ExportedWallets): Record<string, unknown> {
+  const { solana, robinhood } = exported;
+  const failed = [solana?.error && solana.address, robinhood?.error && robinhood.address].filter(Boolean);
+  return {
+    solana: solana?.secretKey ? solana.address : undefined,
+    robinhood: robinhood?.privateKey ? robinhood.address : undefined,
+    ...(failed.length > 0 ? { failed } : {})
   };
 }
 
 function walletExportMessage(title: string, exported: ExportedWallets): string {
   const { solana, robinhood } = exported;
+  const keyLine = (key: string | undefined, error: string | undefined) =>
+    key ? `Private key: <code>${escapeHtml(key)}</code>` : `&#9888; ${escapeHtml(error ?? "The key couldn't be decrypted.")}`;
   return [
     `<b>${escapeHtml(title)}</b>`,
-    "",
-    "<b>Keep this private.</b> Anyone with a private key controls that wallet. Import it into Phantom (Solana) or MetaMask " +
-      "(Robinhood Chain) to move funds, then delete this message.",
+    ...(solana?.secretKey || robinhood?.privateKey
+      ? [
+          "",
+          "<b>Keep this private.</b> Anyone with a private key controls that wallet. Import it into Phantom (Solana) or MetaMask " +
+            "(Robinhood Chain) to move funds, then delete this message."
+        ]
+      : []),
     ...(solana
       ? [
           "",
           "<b>Solana</b>",
           `Address: <code>${escapeHtml(solana.address)}</code>`,
-          `Private key: <code>${escapeHtml(solana.secretKey)}</code>`,
+          keyLine(solana.secretKey, solana.error),
           ...(solana.apiKey ? [`PumpPortal API key: <code>${escapeHtml(solana.apiKey)}</code>`] : [])
         ]
       : []),
@@ -2815,7 +2839,7 @@ function walletExportMessage(title: string, exported: ExportedWallets): string {
           "",
           "<b>Robinhood Chain</b>",
           `Address: <code>${escapeHtml(robinhood.address)}</code>`,
-          `Private key: <code>${escapeHtml(robinhood.privateKey)}</code>`
+          keyLine(robinhood.privateKey, robinhood.error)
         ]
       : [])
   ].join("\n");
@@ -2860,11 +2884,7 @@ async function sendGroupWalletExport(ctx: Context, userId: number, groupId: stri
       await ctx.reply("That group has no wallets yet.");
       return;
     }
-    audit(ctx, "wallet_export_group", undefined, {
-      groupId,
-      solana: exported.solana?.address,
-      robinhood: exported.robinhood?.address
-    });
+    audit(ctx, "wallet_export_group", undefined, { groupId, ...exportAuditDetails(exported) });
     await ctx.reply(walletExportMessage(`Group wallets for ${groupId}`, exported), telegramReplyOptions);
   } catch (error) {
     await ctx.reply(formatError(error), telegramReplyOptions);

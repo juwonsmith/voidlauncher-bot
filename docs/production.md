@@ -42,7 +42,7 @@ Back up these together:
 
 - `.env`
 - your Postgres database
-- `WALLET_ENCRYPTION_KEY`
+- `WALLET_ENCRYPTION_KEY`, any `WALLET_ENCRYPTION_LEGACY_KEYS`, and `data/wallet.key` if a local bot ever ran without a key
 
 If `WALLET_ENCRYPTION_KEY` is lost, encrypted launch wallets may be unrecoverable. Store it outside Render as well as in Render's secret environment variables.
 

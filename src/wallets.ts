@@ -18,6 +18,8 @@ export interface WalletView {
   balanceSol?: number;
   balanceEth?: number;
   balanceError?: string;
+  /** Set when none of the bot's keys can decrypt this wallet, so it can't launch from or export it. */
+  keyError?: string;
   created: boolean;
 }
 
@@ -31,6 +33,7 @@ export async function getOrCreateRobinhoodWallet(scope: "group" | "user", scopeI
     address: wallet.address,
     provider: wallet.provider,
     hasApiKey: false,
+    keyError: walletKeyError(wallet),
     created: !existing
   };
 }
@@ -44,6 +47,7 @@ export async function getOrCreateWallet(scope: WalletScope, scopeId: string): Pr
     address: wallet.address,
     provider: wallet.provider,
     hasApiKey: Boolean(wallet.encryptedApiKey),
+    keyError: walletKeyError(wallet),
     created: !existing
   };
 }
@@ -64,6 +68,7 @@ export async function getOrCreatePumpPortalWallet(scope: WalletScope, scopeId: s
       address: existing.address,
       provider: existing.provider,
       hasApiKey: true,
+      keyError: walletKeyError(existing),
       created: false
     };
   }
@@ -90,6 +95,7 @@ export async function getWalletView(scope: WalletScope, scopeId: string): Promis
     provider: wallet.provider,
     hasApiKey: Boolean(wallet.encryptedApiKey),
     ...(await safeSolBalance(wallet.address)),
+    keyError: walletKeyError(wallet),
     created: false
   };
 }
@@ -104,25 +110,23 @@ export async function getWalletSummary(scope: WalletScope, scopeId: string): Pro
     address: wallet.address,
     provider: wallet.provider,
     hasApiKey: Boolean(wallet.encryptedApiKey),
+    keyError: walletKeyError(wallet),
     created: false
   };
 }
 
 export function decryptWalletSecret(wallet: StoredWallet): Uint8Array {
-  const key = walletEncryptionKey();
-  const [ivBase64, tagBase64, encryptedBase64] = wallet.encryptedSecretKey.split(".");
-  if (!ivBase64 || !tagBase64 || !encryptedBase64) {
-    throw new Error("Wallet secret is not in the expected encrypted format.");
+  return new Uint8Array(decryptSecret(wallet.encryptedSecretKey));
+}
+
+/** Why the bot can't decrypt a stored wallet's key, or undefined when it can. */
+function walletKeyError(wallet: StoredWallet): string | undefined {
+  try {
+    decryptSecret(wallet.encryptedSecretKey);
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
   }
-
-  const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(ivBase64, "base64"));
-  decipher.setAuthTag(Buffer.from(tagBase64, "base64"));
-  const decrypted = Buffer.concat([
-    decipher.update(Buffer.from(encryptedBase64, "base64")),
-    decipher.final()
-  ]);
-
-  return new Uint8Array(decrypted);
 }
 
 export async function exportWalletSecretBase58(
@@ -318,18 +322,33 @@ function encryptSecret(secret: string): string {
 }
 
 function decryptSecretString(encryptedSecret: string): string {
-  const key = walletEncryptionKey();
+  return decryptSecret(encryptedSecret).toString("utf8");
+}
+
+/**
+ * A secret is decrypted with whichever key it was encrypted with: WALLET_ENCRYPTION_KEY, or one of the
+ * WALLET_ENCRYPTION_LEGACY_KEYS for wallets made before a key change. GCM rejects a wrong key, so each is tried in turn.
+ */
+function decryptSecret(encryptedSecret: string): Buffer {
   const [ivBase64, tagBase64, encryptedBase64] = encryptedSecret.split(".");
   if (!ivBase64 || !tagBase64 || !encryptedBase64) {
     throw new Error("Encrypted secret is not in the expected format.");
   }
 
-  const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(ivBase64, "base64"));
-  decipher.setAuthTag(Buffer.from(tagBase64, "base64"));
-  return Buffer.concat([
-    decipher.update(Buffer.from(encryptedBase64, "base64")),
-    decipher.final()
-  ]).toString("utf8");
+  for (const key of [walletEncryptionKey(), ...legacyWalletKeys()]) {
+    try {
+      const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(ivBase64, "base64"));
+      decipher.setAuthTag(Buffer.from(tagBase64, "base64"));
+      return Buffer.concat([decipher.update(Buffer.from(encryptedBase64, "base64")), decipher.final()]);
+    } catch {
+      // Not this key: GCM authentication failed.
+    }
+  }
+
+  throw new Error(
+    "The bot can't unlock this wallet's key: it was encrypted with a different WALLET_ENCRYPTION_KEY. " +
+      "The bot's operator needs to add that key to WALLET_ENCRYPTION_LEGACY_KEYS."
+  );
 }
 
 function stringField(body: Record<string, unknown>, names: string[]): string | undefined {
@@ -357,8 +376,9 @@ export function decryptMintSecret(encryptedSecret: string): string {
   return decryptSecretString(encryptedSecret);
 }
 
-/** Fails startup instead of silently creating a key that a redeploy would throw away. */
+/** Fails startup instead of silently creating a key that a redeploy would throw away, or running with a mistyped one. */
 export function assertWalletEncryptionKeyReady(): void {
+  legacyWalletKeys();
   if (config.WALLET_ENCRYPTION_KEY) {
     walletEncryptionKey();
     return;
@@ -375,10 +395,21 @@ function walletEncryptionKey(): Buffer {
     return localWalletKey();
   }
 
-  const raw = config.WALLET_ENCRYPTION_KEY.trim();
+  return parseWalletKey(config.WALLET_ENCRYPTION_KEY, "WALLET_ENCRYPTION_KEY");
+}
+
+function legacyWalletKeys(): Buffer[] {
+  return config.WALLET_ENCRYPTION_LEGACY_KEYS.split(/[\s,]+/)
+    .filter(Boolean)
+    .map((key) => parseWalletKey(key, "Each key in WALLET_ENCRYPTION_LEGACY_KEYS"));
+}
+
+/** 64 hex characters or base64, like the data/wallet.key file the bot writes when no key is set. */
+function parseWalletKey(value: string, name: string): Buffer {
+  const raw = value.trim();
   const bytes = raw.length === 64 && /^[a-f0-9]+$/i.test(raw) ? Buffer.from(raw, "hex") : Buffer.from(raw, "base64");
   if (bytes.length !== 32) {
-    throw new Error("WALLET_ENCRYPTION_KEY must decode to exactly 32 bytes.");
+    throw new Error(`${name} must decode to exactly 32 bytes.`);
   }
 
   return bytes;

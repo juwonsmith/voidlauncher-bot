@@ -77,6 +77,9 @@ const envSchema = z.object({
   HEALTHCHECK_PORT: z.coerce.number().int().min(0).default(0),
   LOG_DIR: z.string().default("./logs"),
   WALLET_ENCRYPTION_KEY: z.string().optional(),
+  // Keys that older wallets were encrypted with (comma-separated), e.g. a local data/wallet.key from before the
+  // move to Render. New wallets always use WALLET_ENCRYPTION_KEY; these are only tried when it can't decrypt.
+  WALLET_ENCRYPTION_LEGACY_KEYS: z.string().default(""),
   // Custom CA orders: "length:fee" pairs in SOL, e.g. "3:0.05,4:0.1". Empty turns the feature off.
   CUSTOM_CA_FEES_SOL: z.string().default(""),
   // Grinder speed used for wait estimates; measured ~40k/s on a 4-core PC with the Rust worker.
